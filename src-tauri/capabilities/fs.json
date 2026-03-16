@@ -1,0 +1,8 @@
+{
+    "identifier": "fs-dump-dev",
+    "description": "Permite salvar dumps SQL em qualquer pasta (DEV).",
+    "windows": ["main"],
+    "permissions": [
+      "fs:write-all"
+    ]
+  }
