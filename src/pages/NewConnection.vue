@@ -2,6 +2,7 @@
 
 import { onMounted, reactive, ref } from "vue"
 import { useRoute, useRouter } from "vue-router"
+import { invoke } from "@tauri-apps/api/core"
 
 import { useConnectionsStore } from "../stores/connections"
 
@@ -10,6 +11,8 @@ const route = useRoute()
 const store = useConnectionsStore()
 
 const editingIndex = ref(null)
+const testing = ref(false)
+const testMessage = ref(null)
 
 const form = reactive({
 
@@ -46,6 +49,28 @@ onMounted(() => {
   }
 
 })
+
+async function testConnection() {
+  if (!form.host?.trim()) {
+    testMessage.value = { ok: false, text: "Informe o host." }
+    return
+  }
+  testing.value = true
+  testMessage.value = null
+  try {
+    await invoke("connect_db", {
+      host: form.host.trim(),
+      port: Number(form.port) || 3306,
+      user: form.username || "",
+      pass: form.password || ""
+    })
+    testMessage.value = { ok: true, text: "Conexão OK." }
+  } catch (e) {
+    testMessage.value = { ok: false, text: String(e) }
+  } finally {
+    testing.value = false
+  }
+}
 
 function save() {
 
@@ -99,6 +124,14 @@ function save() {
   Salvar como favorita
 </label>
 
+<div v-if="testMessage" :class="['test-message', testMessage.ok ? 'success' : 'error']">
+  {{ testMessage.text }}
+</div>
+
+<button @click="testConnection" :disabled="testing">
+  {{ testing ? "Testando…" : "Testar conexão" }}
+</button>
+
 <button @click="save">
   Salvar
 </button>
@@ -108,3 +141,20 @@ function save() {
 </button>
 
 </template>
+
+<style scoped>
+.test-message {
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-size: 14px;
+  margin-bottom: 8px;
+}
+.test-message.success {
+  background: rgba(56, 189, 124, 0.2);
+  color: #38bd7c;
+}
+.test-message.error {
+  background: rgba(248, 113, 113, 0.2);
+  color: #f87171;
+}
+</style>

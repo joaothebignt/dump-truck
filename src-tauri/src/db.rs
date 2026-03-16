@@ -6,6 +6,13 @@ pub async fn create_pool(conn: &str) -> Result<MySqlPool, sqlx::Error> {
     MySqlPool::connect(conn).await
 }
 
+const SYSTEM_DATABASES: &[&str] = &[
+    "sys",
+    "information_schema",
+    "mysql",
+    "performance_schema",
+];
+
 pub async fn list_databases(pool: &MySqlPool) -> Result<Vec<String>, sqlx::Error> {
     let rows = sqlx::query("SHOW DATABASES").fetch_all(pool).await?;
 
@@ -13,8 +20,9 @@ pub async fn list_databases(pool: &MySqlPool) -> Result<Vec<String>, sqlx::Error
 
     for row in rows {
         let name: String = row.get(0);
-
-        dbs.push(name);
+        if !SYSTEM_DATABASES.contains(&name.as_str()) {
+            dbs.push(name);
+        }
     }
 
     Ok(dbs)

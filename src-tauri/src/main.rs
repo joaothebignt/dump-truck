@@ -44,6 +44,21 @@ async fn connect_db(host: String, port: u16, user: String, pass: String) -> Resu
 }
 
 #[tauri::command]
+async fn check_connection(host: String, port: u16) -> Result<bool, String> {
+    let addr = format!("{}:{}", host, port);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(true),
+        Ok(Err(_)) => Ok(false),
+        Err(_) => Ok(false),
+    }
+}
+
+#[tauri::command]
 async fn databases(conn: String) -> Result<Vec<String>, String> {
     let pool = create_pool(&conn).await.map_err(|e| e.to_string())?;
 
@@ -239,6 +254,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             connect_db,
+            check_connection,
             databases,
             tables_with_size,
             dump_tables,

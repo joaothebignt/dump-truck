@@ -1,6 +1,6 @@
 <script setup>
 
-import { computed, onMounted } from "vue"
+import { computed, onMounted, ref, watch } from "vue"
 import { useRouter } from "vue-router"
 import { invoke } from "@tauri-apps/api/core"
 
@@ -12,10 +12,48 @@ const dbStore = useDatabaseStore()
 const router = useRouter()
 
 const hasConnection = computed(() => !!dbStore.connection)
+const connectionStatus = ref({})
 
-onMounted(()=>{
+function connectionKey(c) {
+  return `${c.host || ""}:${c.port ?? 3306}`
+}
+
+function isOffline(c) {
+  const key = connectionKey(c)
+  return connectionStatus.value[key] === false
+}
+
+async function refreshConnectionStatus() {
+  const next = { ...connectionStatus.value }
+  const list = store.favorites || []
+  const results = await Promise.allSettled(
+    list.map(async (c) => {
+      const key = connectionKey(c)
+      try {
+        const ok = await invoke("check_connection", {
+          host: String(c.host || ""),
+          port: Number(c.port) || 3306
+        })
+        return { key, ok }
+      } catch {
+        return { key, ok: false }
+      }
+    })
+  )
+  results.forEach((r) => {
+    if (r.status === "fulfilled" && r.value) {
+      next[r.value.key] = r.value.ok
+    }
+  })
+  connectionStatus.value = next
+}
+
+onMounted(() => {
   store.load()
+  refreshConnectionStatus()
 })
+
+watch(() => store.favorites, () => refreshConnectionStatus(), { deep: true })
 
 function newConnection(){
   router.push("/connection/new")
@@ -82,7 +120,8 @@ function editConnection(index){
     <div
       class="connection"
       v-for="(c, index) in store.favorites"
-      :key="c.name"
+      :key="connectionKey(c) + '-' + index"
+      :class="{ offline: isOffline(c) }"
       :style="{ borderLeftColor: c.color || '#3a7afe' }"
     >
 
@@ -90,7 +129,8 @@ function editConnection(index){
         class="connection-name"
         @click="connect(c)"
       >
-        {{c.name}}
+        {{ c.name }}
+        <span v-if="isOffline(c)" class="connection-offline">Offline</span>
       </span>
 
       <button
@@ -157,6 +197,19 @@ function editConnection(index){
 
 .connection:hover{
   background:#333;
+}
+
+.connection.offline .connection-name {
+  opacity: 0.85;
+}
+
+.connection-offline {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+  color: #888;
+  font-weight: 500;
 }
 
 .delete-btn{
