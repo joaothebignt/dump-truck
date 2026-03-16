@@ -33,8 +33,27 @@ export const useConnectionsStore = defineStore("connections", {
         host: connection.host,
         port: Number(connection.port),
         username: connection.username,
-        password: connection.password
+        password: connection.password,
+        color: connection.color || "#3a7afe"
       })
+
+      this.save()
+    },
+
+    update(index, connection) {
+
+      if (index < 0 || index >= this.favorites.length)
+        return
+
+      this.favorites[index] = {
+        ...this.favorites[index],
+        name: connection.name,
+        host: connection.host,
+        port: Number(connection.port),
+        username: connection.username,
+        password: connection.password,
+        color: connection.color || this.favorites[index].color || "#3a7afe"
+      }
 
       this.save()
     },

@@ -1,6 +1,6 @@
 <script setup>
 
-import { ref } from "vue"
+import { ref, computed } from "vue"
 import { invoke } from "@tauri-apps/api/core"
 import { save } from "@tauri-apps/plugin-dialog"
 import { writeTextFile } from "@tauri-apps/plugin-fs"
@@ -17,10 +17,14 @@ const progress = ref(0)
 const currentTable = ref("")
 const cancelled = ref(false)
 
+const hasSelectedTables = computed(() =>
+  (props.tables || []).some(t => t.structure || t.content || t.drop)
+)
+
 async function exportDump(){
 
   const selectedTables =
-    (props.tables || []).filter(t => t.selected).map(t => t.name)
+    (props.tables || []).filter(t => t.structure || t.content || t.drop)
 
   if (!selectedTables.length || !store.connection || !store.selectedDatabase)
     return
@@ -41,12 +45,15 @@ async function exportDump(){
         break
 
       const table = selectedTables[i]
-      currentTable.value = table
+      currentTable.value = table.name
 
       const sql = await invoke("dump_single_table",{
         conn: store.connection,
         database: store.selectedDatabase,
-        table
+        table: table.name,
+        structure: table.structure,
+        content: table.content,
+        drop: table.drop
       })
 
       parts.push(sql)
@@ -59,7 +66,10 @@ async function exportDump(){
 
     const finalSql = parts.join("\n\n")
 
-    const suggestedName = `${store.selectedDatabase}.sql`
+    const now = new Date()
+    const date = now.toISOString().slice(0, 10).replace(/-/g, "")
+    const time = now.toTimeString().slice(0, 8).replace(/:/g, "")
+    const suggestedName = `${store.selectedDatabase}_${date}${time}.sql`
 
     const filePath = await save({
       defaultPath: suggestedName,
@@ -103,7 +113,7 @@ function cancelExport(){
 
   <button
     @click="exportDump"
-    :disabled="exporting"
+    :disabled="exporting || !hasSelectedTables"
   >
     {{ exporting ? "Exportando..." : "Export Dump" }}
   </button>

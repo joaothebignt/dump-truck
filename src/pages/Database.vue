@@ -1,7 +1,8 @@
 <script setup>
 
-import { ref, computed, onMounted } from "vue"
+import { ref, computed, onMounted, watch } from "vue"
 import { invoke } from "@tauri-apps/api/core"
+import { open } from "@tauri-apps/plugin-dialog"
 
 import { useDatabaseStore } from "../stores/database"
 import DumpExport from "../components/DumpExport.vue"
@@ -11,6 +12,7 @@ const store = useDatabaseStore()
 const filter = ref("")
 
 const loading = ref(false)
+const importing = ref(false)
 
 const sortKey = ref("name")
 const sortAsc = ref(true)
@@ -51,7 +53,9 @@ const selectedSummary = computed(() => {
   if (!store.tables || !store.tables.length)
     return { count: 0, bytes: 0 }
 
-  const selected = store.tables.filter(t => t.selected)
+  const selected = store.tables.filter(
+    t => t.structure || t.content || t.drop
+  )
 
   const count = selected.length
   const bytes = selected.reduce((sum, t) => sum + (t.size || 0), 0)
@@ -106,7 +110,9 @@ async function loadTables(){
 
       name: t.name,
       size: t.size,
-      selected: true
+      structure: true,
+      content: true,
+      drop: true
 
     }))
 
@@ -117,6 +123,45 @@ async function loadTables(){
   }
 
   loading.value = false
+
+}
+
+async function importDump(){
+
+  if (!store.connection || !store.selectedDatabase)
+    return
+
+  const path = await open({
+    multiple: false,
+    directory: false,
+    filters: [{ name: "SQL", extensions: ["sql"] }],
+    title: "Selecionar arquivo de dump"
+  })
+
+  if (!path)
+    return
+
+  importing.value = true
+
+  try{
+
+    await invoke("import_dump", {
+      conn: store.connection,
+      database: store.selectedDatabase,
+      path
+    })
+
+    alert("Dump importado com sucesso.")
+    loadTables()
+
+  }catch(e){
+
+    console.error(e)
+    alert("Erro ao importar dump.\n\nDetalhes: " + e)
+
+  }
+
+  importing.value = false
 
 }
 
@@ -135,19 +180,17 @@ function toggleSort(key){
 
 }
 
-function toggleAll(){
+function toggleAll(field){
 
   const visible = filteredTables.value
 
   if (!visible.length)
     return
 
-  const allVisibleSelected = visible.every(t => t.selected)
+  const allVisibleChecked = visible.every(t => t[field])
 
-  // só altera as tabelas visíveis (respeitando o filtro),
-  // mantendo o estado das demais
   visible.forEach(t => {
-    t.selected = !allVisibleSelected
+    t[field] = !allVisibleChecked
   })
 
 }
@@ -173,6 +216,16 @@ onMounted(()=>{
 
 })
 
+watch(
+  () => store.connection,
+  () => {
+    store.databases = []
+    store.selectedDatabase = null
+    store.tables = []
+    loadDatabases()
+  }
+)
+
 </script>
 
 <template>
@@ -196,6 +249,36 @@ onMounted(()=>{
 
     </select>
 
+    <button
+      type="button"
+      class="btn-refresh"
+      title="Atualizar lista de bancos"
+      :disabled="!store.connection || loading"
+      @click="loadDatabases"
+    >
+      Atualizar bancos
+    </button>
+
+    <button
+      type="button"
+      class="btn-refresh"
+      title="Atualizar lista de tabelas"
+      :disabled="!store.connection || !store.selectedDatabase || loading"
+      @click="loadTables"
+    >
+      Atualizar tabelas
+    </button>
+
+    <button
+      type="button"
+      class="btn-import"
+      title="Importar arquivo .sql no banco selecionado"
+      :disabled="!store.connection || !store.selectedDatabase || loading || importing"
+      @click="importDump"
+    >
+      {{ importing ? "Importando..." : "Importar dump" }}
+    </button>
+
     <input
       v-model="filter"
       placeholder="Filtrar tabelas..."
@@ -204,11 +287,16 @@ onMounted(()=>{
     <DumpExport :tables="filteredTables" />
 
     <span
-      v-if="selectedSummary.count"
+      v-if="store.tables && store.tables.length"
       class="summary summary--inline"
     >
-      {{ selectedSummary.count }} tabelas:
-      {{ formatSize(selectedSummary.bytes) }}
+      <template v-if="selectedSummary.count">
+        {{ selectedSummary.count }} tabelas:
+        {{ formatSize(selectedSummary.bytes) }}
+      </template>
+      <template v-else>
+        Nenhuma tabela selecionada
+      </template>
     </span>
 
   </div>
@@ -222,18 +310,16 @@ onMounted(()=>{
     </div>
   </div>
 
-  <table v-if="!loading">
+  <div
+    v-if="!loading"
+    class="table-container"
+  >
 
-    <thead>
+    <table>
+
+      <thead>
 
       <tr>
-        <th>
-          <input
-            type="checkbox"
-            :checked="filteredTables.length && filteredTables.every(t => t.selected)"
-            @change="toggleAll"
-          >
-        </th>
         <th
           class="sortable"
           @click="toggleSort('name')"
@@ -246,40 +332,88 @@ onMounted(()=>{
         >
           Tamanho
         </th>
-      </tr>
-
-    </thead>
-
-    <tbody>
-
-      <tr
-        v-for="t in filteredTables"
-        :key="t.name"
-      >
-
-        <td>
+        <th class="col-action">
           <input
             type="checkbox"
-            v-model="t.selected"
+            title="Structure"
+            :checked="filteredTables.length && filteredTables.every(t => t.structure)"
+            @change="toggleAll('structure')"
           >
-        </td>
-
-        <td>{{t.name}}</td>
-
-        <td>{{formatSize(t.size)}}</td>
-
+          S
+        </th>
+        <th class="col-action">
+          <input
+            type="checkbox"
+            title="Content"
+            :checked="filteredTables.length && filteredTables.every(t => t.content)"
+            @change="toggleAll('content')"
+          >
+          C
+        </th>
+        <th class="col-action">
+          <input
+            type="checkbox"
+            title="Drop"
+            :checked="filteredTables.length && filteredTables.every(t => t.drop)"
+            @change="toggleAll('drop')"
+          >
+          D
+        </th>
       </tr>
 
-    </tbody>
+      </thead>
 
-  </table>
+      <tbody>
+
+        <tr
+          v-for="t in filteredTables"
+          :key="t.name"
+        >
+
+          <td>{{t.name}}</td>
+
+          <td>{{formatSize(t.size)}}</td>
+
+          <td class="col-action">
+            <input
+              type="checkbox"
+              v-model="t.structure"
+            >
+          </td>
+
+          <td class="col-action">
+            <input
+              type="checkbox"
+              v-model="t.content"
+            >
+          </td>
+
+          <td class="col-action">
+            <input
+              type="checkbox"
+              v-model="t.drop"
+            >
+          </td>
+
+        </tr>
+
+      </tbody>
+
+    </table>
+
+  </div>
 
   <div
-    v-if="selectedSummary.count"
+    v-if="store.tables && store.tables.length"
     class="summary"
   >
-    {{ selectedSummary.count }} tabelas:
-    {{ (selectedSummary.bytes/1024/1024).toFixed(2) }} MB
+    <template v-if="selectedSummary.count">
+      {{ selectedSummary.count }} tabelas:
+      {{ formatSize(selectedSummary.bytes) }}
+    </template>
+    <template v-else>
+      Nenhuma tabela selecionada
+    </template>
   </div>
 
 </div>
@@ -291,16 +425,57 @@ onMounted(()=>{
 .database-page{
   display:flex;
   flex-direction:column;
+  height:100%;
+  min-height:0;
 }
 
 .toolbar{
   display:flex;
+  flex-wrap:wrap;
+  align-items:center;
   gap:10px;
   margin-bottom:15px;
 }
 
 select,input{
   padding:6px;
+}
+
+.btn-refresh{
+  padding:6px 10px;
+  font-size:13px;
+  border:1px solid #ccc;
+  border-radius:4px;
+  background:#fff;
+  cursor:pointer;
+}
+
+.btn-refresh:hover:not(:disabled){
+  background:#f0f0f0;
+}
+
+.btn-refresh:disabled{
+  opacity:0.6;
+  cursor:not-allowed;
+}
+
+.btn-import{
+  padding:6px 10px;
+  font-size:13px;
+  border:1px solid #0a7;
+  border-radius:4px;
+  background:#e8f8f5;
+  color:#057;
+  cursor:pointer;
+}
+
+.btn-import:hover:not(:disabled){
+  background:#d0f0eb;
+}
+
+.btn-import:disabled{
+  opacity:0.6;
+  cursor:not-allowed;
 }
 
 table{
@@ -316,6 +491,10 @@ th,td{
 
 th{
   background:#f5f5f5;
+  position:sticky;
+  top:0;
+  z-index:1;
+  box-shadow:0 1px 0 #ddd;
 }
 
 .sortable{
@@ -359,6 +538,19 @@ th{
 .summary--inline{
   margin-top:0;
   margin-left:auto;
+}
+
+.table-container{
+  flex:1;
+  min-height:0;
+  overflow-y:auto;
+  border-radius:4px;
+}
+
+.col-action{
+  width:60px;
+  text-align:center;
+  white-space:nowrap;
 }
 
 @keyframes progress-pulse{

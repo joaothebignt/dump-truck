@@ -61,6 +61,12 @@ function disconnect(){
 
 }
 
+function editConnection(index){
+
+  router.push(`/connection/edit/${index}`)
+
+}
+
 </script>
 
 <template>
@@ -77,6 +83,7 @@ function disconnect(){
       class="connection"
       v-for="(c, index) in store.favorites"
       :key="c.name"
+      :style="{ borderLeftColor: c.color || '#3a7afe' }"
     >
 
       <span
@@ -85,6 +92,14 @@ function disconnect(){
       >
         {{c.name}}
       </span>
+
+      <button
+        class="edit-btn"
+        @click.stop="editConnection(index)"
+        title="Editar conexão"
+      >
+        ✎
+      </button>
 
       <button
         class="delete-btn"
@@ -137,6 +152,7 @@ function disconnect(){
   display:flex;
   align-items:center;
   justify-content:space-between;
+  border-left:3px solid transparent;
 }
 
 .connection:hover{
@@ -154,6 +170,19 @@ function disconnect(){
 
 .delete-btn:hover{
   color:#f88;
+}
+
+.edit-btn{
+  background:transparent;
+  border:none;
+  color:#888;
+  cursor:pointer;
+  font-size:13px;
+  padding:0 4px;
+}
+
+.edit-btn:hover{
+  color:#3a7afe;
 }
 
 .new-btn{

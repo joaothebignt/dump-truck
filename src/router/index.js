@@ -14,6 +14,10 @@ const routes = [
     component: NewConnection
   },
   {
+    path: "/connection/edit/:index",
+    component: NewConnection
+  },
+  {
     path: "/database",
     component: Database
   }

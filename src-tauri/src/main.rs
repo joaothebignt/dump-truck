@@ -3,7 +3,7 @@ mod models;
 
 use sqlx::MySqlPool;
 use std::io::ErrorKind;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use db::*;
 
@@ -123,7 +123,14 @@ async fn dump_single_table(
     conn: String,
     database: String,
     table: String,
+    structure: bool,
+    content: bool,
+    drop: bool,
 ) -> Result<String, String> {
+    if !structure && !content {
+        return Ok(String::new());
+    }
+
     let (host, port, user, pass) = parse_mysql_conn(&conn)?;
 
     let db_name = database.clone();
@@ -138,9 +145,21 @@ async fn dump_single_table(
             .arg(port.to_string())
             .arg("-u")
             .arg(user)
-            .arg(format!("-p{}", pass))
-            .arg(&db_name)
-            .arg(&table_name);
+            .arg(format!("-p{}", pass));
+
+        if structure && !content {
+            cmd.arg("--no-data");
+        } else if content && !structure {
+            cmd.arg("--no-create-info");
+        }
+
+        if drop {
+            cmd.arg("--add-drop-table");
+        } else {
+            cmd.arg("--skip-add-drop-table");
+        }
+
+        cmd.arg(&db_name).arg(&table_name);
 
         cmd.output()
     })
@@ -163,6 +182,57 @@ async fn dump_single_table(
     Ok(sql)
 }
 
+#[tauri::command]
+async fn import_dump(
+    conn: String,
+    database: String,
+    path: String,
+) -> Result<(), String> {
+    let (host, port, user, pass) = parse_mysql_conn(&conn)?;
+
+    let db_name = database.clone();
+    let path = std::path::PathBuf::from(path);
+
+    if !path.exists() {
+        return Err("Arquivo não encontrado.".to_string());
+    }
+
+    let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new("mysql");
+
+        cmd.arg("-h")
+            .arg(host)
+            .arg("-P")
+            .arg(port.to_string())
+            .arg("-u")
+            .arg(user)
+            .arg(format!("-p{}", pass))
+            .arg(&db_name)
+            .stdin(Stdio::from(file))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        cmd.output()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e: std::io::Error| {
+        if e.kind() == ErrorKind::NotFound {
+            return "mysql não encontrado no PATH. Instale o cliente MySQL/mariadb."
+                .to_string();
+        }
+        e.to_string()
+    })?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
@@ -172,7 +242,8 @@ fn main() {
             databases,
             tables_with_size,
             dump_tables,
-            dump_single_table
+            dump_single_table,
+            import_dump
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

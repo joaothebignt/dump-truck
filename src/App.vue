@@ -18,7 +18,9 @@ import Sidebar from "./components/Sidebar.vue"
     </aside>
 
     <section class="content">
-      <RouterView />
+      <div class="content-inner">
+        <RouterView />
+      </div>
     </section>
 
   </div>
@@ -67,9 +69,19 @@ html,body,#app{
 
 .content{
   flex:1;
+  display:flex;
+  flex-direction:column;
+  min-height:0;
   background:#fafafa;
   padding:20px;
-  overflow:auto;
+}
+
+.content-inner{
+  flex:1;
+  min-height:0;
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
 }
 
 </style>
