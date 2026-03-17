@@ -307,7 +307,9 @@ async fn dump_parallel(
         return Err("nenhuma tabela selecionada".to_string());
     }
 
-    let (host, port, user, pass) = parse_mysql_conn(&conn)?;
+    // Criar pool de conexões MySQL
+    let pool = create_pool(&conn).await.map_err(|e| e.to_string())?;
+    let pool = Arc::new(pool);
 
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
     let output_dir = dump::create_dump_dir(&timestamp)?;
@@ -323,9 +325,7 @@ async fn dump_parallel(
 
     for table in tables {
         let sem = Arc::clone(&semaphore);
-        let host = host.clone();
-        let user = user.clone();
-        let pass = pass.clone();
+        let pool = Arc::clone(&pool);
         let database = database.clone();
         let output_dir = output_dir.clone();
         let app_handle = app.clone();
@@ -345,12 +345,8 @@ async fn dump_parallel(
                 },
             );
 
-            let result = tauri::async_runtime::spawn_blocking(move || {
-                let _permit = permit;
-                dump::dump_one_table(&host, port, &user, &pass, &database, &table, &output_dir)
-            })
-            .await
-            .map_err(|e| e.to_string())?;
+            let result = dump::dump_one_table(&pool, &database, &table, &output_dir).await;
+            drop(permit); // Liberar semáforo após concluir
 
             let (status, error) = match &result {
                 Ok(_) => ("done".to_string(), None),

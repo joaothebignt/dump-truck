@@ -1,8 +1,8 @@
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::models::DumpTableRequest;
+use sqlx::{MySqlPool, Row};
 
 /// Tenta criar e validar um diretório com teste de escrita
 fn try_create_and_validate_dir(path: &PathBuf) -> Result<PathBuf, String> {
@@ -143,15 +143,16 @@ pub fn create_dump_dir_with_settings(
     create_dump_dir(timestamp)
 }
 
-pub fn dump_one_table(
-    host: &str,
-    port: u16,
-    user: &str,
-    pass: &str,
+/// Gera o dump de uma tabela usando sqlx (sem dependência externa)
+pub async fn dump_one_table(
+    pool: &MySqlPool,
     database: &str,
     table: &DumpTableRequest,
     output_dir: &Path,
 ) -> Result<u64, String> {
+    let mut sql_output = String::new();
+
+    // Se não exporta estrutura nem dados, criar arquivo vazio
     if !table.structure && !table.content {
         let empty_path = output_dir.join(format!("{}.sql", table.name));
         std::fs::write(&empty_path, b"").map_err(|e| {
@@ -174,44 +175,120 @@ pub fn dump_one_table(
         return Ok(0);
     }
 
-    let mut cmd = Command::new("mysqldump");
-
-    cmd.arg("-h")
-        .arg(host)
-        .arg("-P")
-        .arg(port.to_string())
-        .arg("-u")
-        .arg(user)
-        .arg(format!("-p{}", pass));
-
-    if table.structure && !table.content {
-        cmd.arg("--no-data");
-    } else if table.content && !table.structure {
-        cmd.arg("--no-create-info");
-    }
-
+    // DROP TABLE se solicitado
     if table.drop {
-        cmd.arg("--add-drop-table");
-    } else {
-        cmd.arg("--skip-add-drop-table");
+        sql_output.push_str(&format!("DROP TABLE IF EXISTS `{}`;\n\n", table.name));
     }
 
-    cmd.arg(database).arg(&table.name);
+    // CREATE TABLE se solicitado
+    if table.structure {
+        let create_stmt = sqlx::query(&format!("SHOW CREATE TABLE `{}`", table.name))
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("Erro ao obter estrutura da tabela '{}': {}", table.name, e))?;
 
-    let output = cmd.output().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            "mysqldump não encontrado no PATH. Instale o cliente MySQL/mariadb e garanta que o binário 'mysqldump' esteja disponível.".to_string()
-        } else {
-            e.to_string()
+        let create_sql: String = create_stmt
+            .try_get(1)
+            .map_err(|e| format!("Erro ao ler CREATE TABLE: {}", e))?;
+
+        sql_output.push_str(&create_sql);
+        sql_output.push_str(";\n\n");
+    }
+
+    // Dados se solicitado
+    if table.content {
+        // Primeiro, obter as colunas da tabela
+        let columns_query = format!(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' \
+             ORDER BY ORDINAL_POSITION",
+            database, table.name
+        );
+
+        let column_rows = sqlx::query(&columns_query)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("Erro ao obter colunas da tabela '{}': {}", table.name, e))?;
+
+        if !column_rows.is_empty() {
+            let columns: Vec<String> = column_rows
+                .iter()
+                .map(|row| row.try_get::<String, _>(0))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Erro ao ler nomes de colunas: {}", e))?;
+
+            // Buscar todos os dados
+            let data_query = format!("SELECT * FROM `{}`", table.name);
+            let data_rows = sqlx::query(&data_query)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| format!("Erro ao obter dados da tabela '{}': {}", table.name, e))?;
+
+            if !data_rows.is_empty() {
+                // Gerar INSERTs em batch (múltiplos valores por INSERT)
+                let batch_size = 100;
+                let column_list = columns
+                    .iter()
+                    .map(|c| format!("`{}`", c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                for chunk in data_rows.chunks(batch_size) {
+                    sql_output.push_str(&format!("INSERT INTO `{}` ({}) VALUES\n", table.name, column_list));
+
+                    for (i, row) in chunk.iter().enumerate() {
+                        sql_output.push_str("(");
+
+                        for (j, _col) in columns.iter().enumerate() {
+                            if j > 0 {
+                                sql_output.push_str(", ");
+                            }
+
+                            // Obter valor como Option<String>
+                            match row.try_get::<Option<Vec<u8>>, _>(j) {
+                                Ok(Some(bytes)) => {
+                                    // Tentar converter para string
+                                    match String::from_utf8(bytes.clone()) {
+                                        Ok(s) => {
+                                            // Escapar string SQL
+                                            let escaped = s
+                                                .replace('\\', "\\\\")
+                                                .replace('\'', "\\'")
+                                                .replace('\n', "\\n")
+                                                .replace('\r', "\\r")
+                                                .replace('\0', "\\0");
+                                            sql_output.push_str(&format!("'{}'", escaped));
+                                        }
+                                        Err(_) => {
+                                            // Dados binários - usar hex
+                                            sql_output.push_str(&format!("0x{}", hex::encode(bytes)));
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    sql_output.push_str("NULL");
+                                }
+                                Err(e) => {
+                                    return Err(format!("Erro ao ler valor da coluna: {}", e));
+                                }
+                            }
+                        }
+
+                        sql_output.push(')');
+                        if i < chunk.len() - 1 {
+                            sql_output.push_str(",\n");
+                        }
+                    }
+
+                    sql_output.push_str(";\n\n");
+                }
+            }
         }
-    })?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
     }
 
+    // Escrever arquivo
     let file_path = output_dir.join(format!("{}.sql", table.name));
-    std::fs::write(&file_path, &output.stdout).map_err(|e| {
+    std::fs::write(&file_path, sql_output.as_bytes()).map_err(|e| {
         match e.kind() {
             std::io::ErrorKind::PermissionDenied => {
                 format!(
@@ -229,7 +306,7 @@ pub fn dump_one_table(
         }
     })?;
 
-    Ok(output.stdout.len() as u64)
+    Ok(sql_output.len() as u64)
 }
 
 pub fn merge_files(output_dir: &Path) -> Result<(u64, u64, PathBuf), String> {
