@@ -307,8 +307,13 @@ async fn dump_parallel(
         return Err("nenhuma tabela selecionada".to_string());
     }
 
-    // Criar pool de conexões MySQL
-    let pool = create_pool(&conn).await.map_err(|e| e.to_string())?;
+    // Criar pool de conexões MySQL com database especificado
+    let pool_conn = if conn.ends_with('/') {
+        format!("{}{}", conn, database)
+    } else {
+        format!("{}/{}", conn, database)
+    };
+    let pool = create_pool(&pool_conn).await.map_err(|e| e.to_string())?;
     let pool = Arc::new(pool);
 
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
