@@ -4,8 +4,6 @@ mod models;
 mod settings;
 
 use sqlx::MySqlPool;
-use std::io::ErrorKind;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -53,33 +51,6 @@ fn validate_dump_directory(dir: &std::path::Path) -> Result<(), String> {
     std::fs::remove_file(&test_file).ok();
 
     Ok(())
-}
-
-fn parse_mysql_conn(conn: &str) -> Result<(String, u16, String, String), String> {
-    // expected format: mysql://user:pass@host:port/
-    let without_scheme = conn
-        .strip_prefix("mysql://")
-        .ok_or_else(|| "invalid mysql connection string".to_string())?;
-
-    let (user_pass, host_part) = without_scheme
-        .split_once('@')
-        .ok_or_else(|| "invalid mysql connection string".to_string())?;
-
-    let (user, pass) = user_pass
-        .split_once(':')
-        .ok_or_else(|| "invalid mysql connection string".to_string())?;
-
-    let host_part = host_part.trim_end_matches('/');
-
-    let (host, port_str) = host_part
-        .split_once(':')
-        .ok_or_else(|| "invalid mysql connection string".to_string())?;
-
-    let port: u16 = port_str
-        .parse()
-        .map_err(|_| "invalid port in connection string".to_string())?;
-
-    Ok((host.to_string(), port, user.to_string(), pass.to_string()))
 }
 
 #[tauri::command]
@@ -139,46 +110,30 @@ async fn dump_tables(
         return Err("nenhuma tabela selecionada".to_string());
     }
 
-    let (host, port, user, pass) = parse_mysql_conn(&conn)?;
+    // Criar pool com database
+    let pool_conn = format!("{}/{}", conn.trim_end_matches('/'), database);
+    let pool = create_pool(&pool_conn).await.map_err(|e| e.to_string())?;
 
-    let db_name = database.clone();
-    let selected_tables = tables.clone();
+    let mut sql_output = String::new();
 
-    let output = tauri::async_runtime::spawn_blocking(move || {
-        let mut cmd = Command::new("mysqldump");
+    // Dump de cada tabela sequencialmente
+    for table in tables {
+        let request = models::DumpTableRequest {
+            name: table,
+            structure: true,
+            content: true,
+            drop: false,
+        };
 
-        cmd.arg("-h")
-            .arg(host)
-            .arg("-P")
-            .arg(port.to_string())
-            .arg("-u")
-            .arg(user)
-            .arg(format!("-p{}", pass))
-            .arg(&db_name);
+        let table_sql = dump::dump_one_table_to_string(&pool, &database, &request).await?;
 
-        for t in selected_tables {
-            cmd.arg(t);
+        if !sql_output.is_empty() {
+            sql_output.push_str("\n\n");
         }
-
-        cmd.output()
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e: std::io::Error| {
-        if e.kind() == ErrorKind::NotFound {
-            return "mysqldump não encontrado no PATH. Instale o cliente MySQL/mariadb e garanta que o binário 'mysqldump' esteja disponível."
-                .to_string();
-        }
-        e.to_string()
-    })?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+        sql_output.push_str(&table_sql);
     }
 
-    let sql = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
-
-    Ok(sql)
+    Ok(sql_output)
 }
 
 #[tauri::command]
@@ -194,55 +149,76 @@ async fn dump_single_table(
         return Ok(String::new());
     }
 
-    let (host, port, user, pass) = parse_mysql_conn(&conn)?;
+    // Criar pool com database
+    let pool_conn = format!("{}/{}", conn.trim_end_matches('/'), database);
+    let pool = create_pool(&pool_conn).await.map_err(|e| e.to_string())?;
 
-    let db_name = database.clone();
-    let table_name = table.clone();
+    // Preparar request
+    let request = models::DumpTableRequest {
+        name: table,
+        structure,
+        content,
+        drop,
+    };
 
-    let output = tauri::async_runtime::spawn_blocking(move || {
-        let mut cmd = Command::new("mysqldump");
+    // Gerar SQL usando função nativa
+    dump::dump_one_table_to_string(&pool, &database, &request).await
+}
 
-        cmd.arg("-h")
-            .arg(host)
-            .arg("-P")
-            .arg(port.to_string())
-            .arg("-u")
-            .arg(user)
-            .arg(format!("-p{}", pass));
+/// Parser simples de SQL que divide em statements respeitando strings
+fn parse_sql_statements(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut string_char = ' ';
+    let mut escape_next = false;
+    let mut chars = sql.chars().peekable();
 
-        if structure && !content {
-            cmd.arg("--no-data");
-        } else if content && !structure {
-            cmd.arg("--no-create-info");
+    while let Some(c) = chars.next() {
+        if escape_next {
+            current.push(c);
+            escape_next = false;
+            continue;
         }
 
-        if drop {
-            cmd.arg("--add-drop-table");
-        } else {
-            cmd.arg("--skip-add-drop-table");
+        match c {
+            '\\' => {
+                current.push(c);
+                escape_next = true;
+            }
+            '\'' | '"' => {
+                current.push(c);
+                if in_string && c == string_char {
+                    in_string = false;
+                } else if !in_string {
+                    in_string = true;
+                    string_char = c;
+                }
+            }
+            ';' if !in_string => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.starts_with("--")
+                    && !trimmed.starts_with("/*") {
+                    statements.push(current.clone());
+                }
+                current.clear();
+            }
+            _ => {
+                current.push(c);
+            }
         }
-
-        cmd.arg(&db_name).arg(&table_name);
-
-        cmd.output()
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e: std::io::Error| {
-        if e.kind() == ErrorKind::NotFound {
-            return "mysqldump não encontrado no PATH. Instale o cliente MySQL/mariadb e garanta que o binário 'mysqldump' esteja disponível."
-                .to_string();
-        }
-        e.to_string()
-    })?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
     }
 
-    let sql = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+    // Último statement se não termina com ;
+    let trimmed = current.trim();
+    if !trimmed.is_empty()
+        && !trimmed.starts_with("--")
+        && !trimmed.starts_with("/*") {
+        statements.push(current);
+    }
 
-    Ok(sql)
+    statements
 }
 
 #[tauri::command]
@@ -251,46 +227,29 @@ async fn import_dump(
     database: String,
     path: String,
 ) -> Result<(), String> {
-    let (host, port, user, pass) = parse_mysql_conn(&conn)?;
-
-    let db_name = database.clone();
     let path = std::path::PathBuf::from(path);
 
     if !path.exists() {
         return Err("Arquivo não encontrado.".to_string());
     }
 
-    let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    // Ler arquivo SQL
+    let sql_content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Erro ao ler arquivo: {}", e))?;
 
-    let output = tauri::async_runtime::spawn_blocking(move || {
-        let mut cmd = Command::new("mysql");
+    // Criar pool com database
+    let pool_conn = format!("{}/{}", conn.trim_end_matches('/'), database);
+    let pool = create_pool(&pool_conn).await.map_err(|e| e.to_string())?;
 
-        cmd.arg("-h")
-            .arg(host)
-            .arg("-P")
-            .arg(port.to_string())
-            .arg("-u")
-            .arg(user)
-            .arg(format!("-p{}", pass))
-            .arg(&db_name)
-            .stdin(Stdio::from(file))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+    // Dividir em statements
+    let statements = parse_sql_statements(&sql_content);
 
-        cmd.output()
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e: std::io::Error| {
-        if e.kind() == ErrorKind::NotFound {
-            return "mysql não encontrado no PATH. Instale o cliente MySQL/mariadb."
-                .to_string();
-        }
-        e.to_string()
-    })?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    // Executar cada statement
+    for (idx, stmt) in statements.iter().enumerate() {
+        sqlx::query(stmt)
+            .execute(&pool)
+            .await
+            .map_err(|e| format!("Erro no statement {}: {}", idx + 1, e))?;
     }
 
     Ok(())

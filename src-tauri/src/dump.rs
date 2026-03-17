@@ -373,3 +373,130 @@ pub fn verify_merge(individual_sum: u64, final_size: u64, table_count: usize) ->
     let separators = (table_count as u64).saturating_sub(1) * 2;
     final_size == individual_sum + separators
 }
+
+/// Gera o dump de uma tabela retornando SQL como String (sem escrever arquivo)
+pub async fn dump_one_table_to_string(
+    pool: &MySqlPool,
+    database: &str,
+    table: &DumpTableRequest,
+) -> Result<String, String> {
+    let mut sql_output = String::new();
+
+    // Se não exporta estrutura nem dados, retornar vazio
+    if !table.structure && !table.content {
+        return Ok(String::new());
+    }
+
+    // DROP TABLE se solicitado
+    if table.drop {
+        sql_output.push_str(&format!("DROP TABLE IF EXISTS `{}`;\n\n", table.name));
+    }
+
+    // CREATE TABLE se solicitado
+    if table.structure {
+        let create_stmt = sqlx::query(&format!("SHOW CREATE TABLE `{}`", table.name))
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("Erro ao obter estrutura da tabela '{}': {}", table.name, e))?;
+
+        let create_sql: String = create_stmt
+            .try_get(1)
+            .map_err(|e| format!("Erro ao ler CREATE TABLE: {}", e))?;
+
+        sql_output.push_str(&create_sql);
+        sql_output.push_str(";\n\n");
+    }
+
+    // Dados se solicitado
+    if table.content {
+        // Primeiro, obter as colunas da tabela
+        let columns_query = format!(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' \
+             ORDER BY ORDINAL_POSITION",
+            database, table.name
+        );
+
+        let column_rows = sqlx::query(&columns_query)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("Erro ao obter colunas da tabela '{}': {}", table.name, e))?;
+
+        if !column_rows.is_empty() {
+            let columns: Vec<String> = column_rows
+                .iter()
+                .map(|row| row.try_get::<String, _>(0))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Erro ao ler nomes de colunas: {}", e))?;
+
+            // Buscar todos os dados
+            let data_query = format!("SELECT * FROM `{}`", table.name);
+            let data_rows = sqlx::query(&data_query)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| format!("Erro ao obter dados da tabela '{}': {}", table.name, e))?;
+
+            if !data_rows.is_empty() {
+                // Gerar INSERTs em batch (múltiplos valores por INSERT)
+                let batch_size = 100;
+                let column_list = columns
+                    .iter()
+                    .map(|c| format!("`{}`", c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                for chunk in data_rows.chunks(batch_size) {
+                    sql_output.push_str(&format!("INSERT INTO `{}` ({}) VALUES\n", table.name, column_list));
+
+                    for (i, row) in chunk.iter().enumerate() {
+                        sql_output.push_str("(");
+
+                        for (j, _col) in columns.iter().enumerate() {
+                            if j > 0 {
+                                sql_output.push_str(", ");
+                            }
+
+                            // Obter valor como Option<String>
+                            match row.try_get::<Option<Vec<u8>>, _>(j) {
+                                Ok(Some(bytes)) => {
+                                    // Tentar converter para string
+                                    match String::from_utf8(bytes.clone()) {
+                                        Ok(s) => {
+                                            // Escapar string SQL
+                                            let escaped = s
+                                                .replace('\\', "\\\\")
+                                                .replace('\'', "\\'")
+                                                .replace('\n', "\\n")
+                                                .replace('\r', "\\r")
+                                                .replace('\0', "\\0");
+                                            sql_output.push_str(&format!("'{}'", escaped));
+                                        }
+                                        Err(_) => {
+                                            // Dados binários - usar hex
+                                            sql_output.push_str(&format!("0x{}", hex::encode(bytes)));
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    sql_output.push_str("NULL");
+                                }
+                                Err(e) => {
+                                    return Err(format!("Erro ao ler valor da coluna: {}", e));
+                                }
+                            }
+                        }
+
+                        sql_output.push(')');
+                        if i < chunk.len() - 1 {
+                            sql_output.push_str(",\n");
+                        }
+                    }
+
+                    sql_output.push_str(";\n\n");
+                }
+            }
+        }
+    }
+
+    Ok(sql_output)
+}
