@@ -1,9 +1,8 @@
 <script setup>
 
-import { ref, computed } from "vue"
+import { ref, reactive, computed } from "vue"
 import { invoke } from "@tauri-apps/api/core"
-import { save } from "@tauri-apps/plugin-dialog"
-import { writeTextFile } from "@tauri-apps/plugin-fs"
+import { listen } from "@tauri-apps/api/event"
 import { useDatabaseStore } from "../stores/database"
 
 const props = defineProps({
@@ -14,12 +13,26 @@ const store = useDatabaseStore()
 
 const exporting = ref(false)
 const progress = ref(0)
-const currentTable = ref("")
-const cancelled = ref(false)
+const resultPath = ref("")
+const tableStatuses = reactive({})
 
 const hasSelectedTables = computed(() =>
   (props.tables || []).some(t => t.structure || t.content || t.drop)
 )
+
+const statusLabel = {
+  pending: "Aguardando",
+  dumping: "Exportando...",
+  done: "Concluido",
+  error: "Erro"
+}
+
+const statusIcon = {
+  pending: "\u23F3",
+  dumping: "\u26A1",
+  done: "\u2705",
+  error: "\u274C"
+}
 
 async function exportDump(){
 
@@ -31,59 +44,44 @@ async function exportDump(){
 
   exporting.value = true
   progress.value = 0
-  currentTable.value = ""
-  cancelled.value = false
+  resultPath.value = ""
+
+  const tables = selectedTables.map(t => ({
+    name: t.name,
+    structure: t.structure,
+    content: t.content,
+    drop: t.drop
+  }))
+
+  for (const t of tables) {
+    tableStatuses[t.name] = "pending"
+  }
+
+  const total = tables.length
+  let unlisten = null
 
   try{
 
-    const total = selectedTables.length
-    const parts = []
+    unlisten = await listen("dump-progress", (event) => {
+      const p = event.payload
+      tableStatuses[p.table] = p.status
 
-    for (let i = 0; i < total; i++) {
-
-      if (cancelled.value)
-        break
-
-      const table = selectedTables[i]
-      currentTable.value = table.name
-
-      const sql = await invoke("dump_single_table",{
-        conn: store.connection,
-        database: store.selectedDatabase,
-        table: table.name,
-        structure: table.structure,
-        content: table.content,
-        drop: table.drop
-      })
-
-      parts.push(sql)
-      progress.value = Math.round(((i + 1) / total) * 100)
-
-    }
-
-    if (cancelled.value || !parts.length)
-      return
-
-    const finalSql = parts.join("\n\n")
-
-    const now = new Date()
-    const date = now.toISOString().slice(0, 10).replace(/-/g, "")
-    const time = now.toTimeString().slice(0, 8).replace(/:/g, "")
-    const suggestedName = `${store.selectedDatabase}_${date}${time}.sql`
-
-    const filePath = await save({
-      defaultPath: suggestedName,
-      filters: [
-        { name: "SQL Dump", extensions: ["sql"] }
-      ]
+      if (p.completed && p.total) {
+        progress.value = Math.round((p.completed / p.total) * 100)
+      }
     })
 
-    if (!filePath) {
-      // usuário cancelou
-      return
-    }
+    const result = await invoke("dump_parallel", {
+      conn: store.connection,
+      database: store.selectedDatabase,
+      tables
+    })
 
-    await writeTextFile(filePath, finalSql)
+    resultPath.value = result.final_file
+
+    if (!result.verified) {
+      alert("Dump gerado, mas a verificacao de integridade falhou.\nArquivo: " + result.final_file)
+    }
 
   }catch(e){
 
@@ -92,17 +90,16 @@ async function exportDump(){
 
   }finally{
 
+    if (unlisten) unlisten()
     exporting.value = false
-    currentTable.value = ""
 
   }
 
 }
 
-function cancelExport(){
-
-  cancelled.value = true
-
+function resetExport(){
+  resultPath.value = ""
+  Object.keys(tableStatuses).forEach(k => delete tableStatuses[k])
 }
 
 </script>
@@ -118,14 +115,6 @@ function cancelExport(){
     {{ exporting ? "Exportando..." : "Export Dump" }}
   </button>
 
-  <button
-    v-if="exporting"
-    class="cancel-btn"
-    @click="cancelExport"
-  >
-    Cancelar
-  </button>
-
   <div
     v-if="exporting"
     class="export-status"
@@ -137,8 +126,32 @@ function cancelExport(){
       />
     </div>
     <div class="export-text">
-      {{ progress }}% - lendo tabela: {{ currentTable }}
+      {{ progress }}%
     </div>
+  </div>
+
+  <div
+    v-if="Object.keys(tableStatuses).length"
+    class="table-status-list"
+  >
+    <div
+      v-for="(status, name) in tableStatuses"
+      :key="name"
+      class="table-status-item"
+      :class="'status-' + status"
+    >
+      <span class="table-status-icon">{{ statusIcon[status] }}</span>
+      <span class="table-status-name">{{ name }}</span>
+      <span class="table-status-label">{{ statusLabel[status] }}</span>
+    </div>
+  </div>
+
+  <div
+    v-if="resultPath && !exporting"
+    class="export-result"
+  >
+    Dump salvo em: <span class="export-path">{{ resultPath }}</span>
+    <button class="btn-reset" @click="resetExport">Limpar</button>
   </div>
 
 </div>
@@ -185,14 +198,92 @@ button[disabled]{
   white-space:nowrap;
 }
 
-.cancel-btn{
-  align-self:flex-start;
-  font-size:11px;
+.table-status-list{
+  display:flex;
+  flex-direction:column;
+  gap:2px;
+  margin-top:4px;
+  max-height:200px;
+  overflow-y:auto;
+  font-size:12px;
+}
+
+.table-status-item{
+  display:flex;
+  align-items:center;
+  gap:6px;
   padding:2px 6px;
   border-radius:4px;
-  border:1px solid #ccc;
-  background:#f8f8f8;
+  transition:background 0.2s, opacity 0.2s;
+}
+
+.table-status-icon{
+  flex-shrink:0;
+  width:16px;
+  text-align:center;
+}
+
+.table-status-name{
+  flex:1;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  font-family:monospace;
+}
+
+.table-status-label{
+  flex-shrink:0;
+  font-size:11px;
+  color:#888;
+}
+
+.status-pending{
+  opacity:0.5;
+}
+
+.status-dumping{
+  background:#e8f0fe;
+  opacity:1;
+}
+
+.status-done{
+  opacity:0.7;
+}
+
+.status-error{
+  background:#fde8e8;
+  opacity:1;
+}
+
+.status-error .table-status-label{
+  color:#c53030;
+}
+
+.export-result{
+  font-size:11px;
+  color:#333;
+  word-break:break-all;
+  display:flex;
+  align-items:center;
+  gap:6px;
+  flex-wrap:wrap;
+}
+
+.export-path{
+  font-weight:600;
+}
+
+.btn-reset{
+  font-size:10px;
+  padding:1px 6px;
   cursor:pointer;
+  border:1px solid #ccc;
+  border-radius:4px;
+  background:#f5f5f5;
+}
+
+.btn-reset:hover{
+  background:#e0e0e0;
 }
 
 </style>

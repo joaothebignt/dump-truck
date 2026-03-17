@@ -1,11 +1,59 @@
 mod db;
+mod dump;
 mod models;
+mod settings;
 
 use sqlx::MySqlPool;
 use std::io::ErrorKind;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+
+use tauri::Emitter;
 
 use db::*;
+
+/// Valida se o diretório existe e tem permissão de escrita
+fn validate_dump_directory(dir: &std::path::Path) -> Result<(), String> {
+    // Verificar se existe
+    if !dir.exists() {
+        return Err(format!(
+            "Diretório de dump '{}' não existe.",
+            dir.display()
+        ));
+    }
+
+    // Verificar se é diretório
+    if !dir.is_dir() {
+        return Err(format!(
+            "'{}' não é um diretório.",
+            dir.display()
+        ));
+    }
+
+    // Testar permissão de escrita
+    let test_file = dir.join(".write_validation_test");
+    std::fs::write(&test_file, b"test").map_err(|e| {
+        match e.kind() {
+            std::io::ErrorKind::PermissionDenied => {
+                format!(
+                    "Sem permissão de escrita no diretório '{}'. Verifique as permissões do sistema de arquivos.",
+                    dir.display()
+                )
+            }
+            _ => format!(
+                "Erro ao validar permissões de escrita em '{}': {}",
+                dir.display(),
+                e
+            ),
+        }
+    })?;
+
+    // Remover arquivo de teste
+    std::fs::remove_file(&test_file).ok();
+
+    Ok(())
+}
 
 fn parse_mysql_conn(conn: &str) -> Result<(String, u16, String, String), String> {
     // expected format: mysql://user:pass@host:port/
@@ -248,6 +296,149 @@ async fn import_dump(
     Ok(())
 }
 
+#[tauri::command]
+async fn dump_parallel(
+    app: tauri::AppHandle,
+    conn: String,
+    database: String,
+    tables: Vec<models::DumpTableRequest>,
+) -> Result<models::DumpResult, String> {
+    if tables.is_empty() {
+        return Err("nenhuma tabela selecionada".to_string());
+    }
+
+    let (host, port, user, pass) = parse_mysql_conn(&conn)?;
+
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let output_dir = dump::create_dump_dir(&timestamp)?;
+
+    // Validar diretório antes de iniciar dumps paralelos
+    validate_dump_directory(&output_dir)?;
+
+    let total = tables.len();
+    let cfg = settings::load();
+    let parallel_limit = cfg.max_parallel_dumps.max(1);
+    let semaphore = Arc::new(Semaphore::new(parallel_limit));
+    let mut handles = Vec::with_capacity(total);
+
+    for table in tables {
+        let sem = Arc::clone(&semaphore);
+        let host = host.clone();
+        let user = user.clone();
+        let pass = pass.clone();
+        let database = database.clone();
+        let output_dir = output_dir.clone();
+        let app_handle = app.clone();
+
+        let handle = tokio::spawn(async move {
+            let permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
+            let table_name = table.name.clone();
+
+            let _ = app_handle.emit(
+                "dump-progress",
+                models::DumpProgress {
+                    table: table_name.clone(),
+                    status: "dumping".to_string(),
+                    completed: 0,
+                    total: 0,
+                    error: None,
+                },
+            );
+
+            let result = tauri::async_runtime::spawn_blocking(move || {
+                let _permit = permit;
+                dump::dump_one_table(&host, port, &user, &pass, &database, &table, &output_dir)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let (status, error) = match &result {
+                Ok(_) => ("done".to_string(), None),
+                Err(e) => ("error".to_string(), Some(e.clone())),
+            };
+            Ok::<_, String>((table_name, status, error, result.map(|_| ())))
+        });
+
+        handles.push(handle);
+    }
+
+    let mut completed = 0usize;
+    let mut permission_errors: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for handle in handles {
+        let (table_name, status, error, result) = handle
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+
+        completed += 1;
+
+        let _ = app.emit(
+            "dump-progress",
+            models::DumpProgress {
+                table: table_name.clone(),
+                status,
+                completed,
+                total,
+                error: error.clone(),
+            },
+        );
+
+        if let Err(e) = result {
+            let error_msg = format!("{}: {}", table_name, e);
+
+            // Categorizar erros de permissão
+            if e.contains("Permissão negada") || e.contains("Permission denied") || e.contains("permissão negada") {
+                permission_errors.push(error_msg);
+            } else {
+                errors.push(error_msg);
+            }
+        }
+    }
+
+    // Retornar erro específico para problemas de permissão
+    if !permission_errors.is_empty() {
+        let suggestion = "\n\nSugestões:\n• Verifique as permissões do diretório de dumps\n• Tente executar o aplicativo com permissões adequadas\n• Verifique se há espaço em disco disponível";
+        return Err(format!(
+            "Erro de permissão ao exportar {} tabela(s):\n{}{}",
+            permission_errors.len(),
+            permission_errors.join("\n"),
+            suggestion
+        ));
+    }
+
+    if !errors.is_empty() {
+        return Err(format!(
+            "Falha ao exportar {} tabela(s):\n{}",
+            errors.len(),
+            errors.join("\n")
+        ));
+    }
+
+    let (individual_sum, final_size, final_path) = dump::merge_files(&output_dir)?;
+    let verified = dump::verify_merge(individual_sum, final_size, total);
+
+    Ok(models::DumpResult {
+        output_dir: output_dir.to_string_lossy().to_string(),
+        final_file: final_path.to_string_lossy().to_string(),
+        table_count: total,
+        individual_size_sum: individual_sum,
+        final_file_size: final_size,
+        verified,
+    })
+}
+
+#[tauri::command]
+fn get_settings() -> settings::AppSettings {
+    settings::load()
+}
+
+#[tauri::command]
+fn save_settings(s: settings::AppSettings) -> Result<(), String> {
+    settings::save(&s)
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
@@ -259,7 +450,10 @@ fn main() {
             tables_with_size,
             dump_tables,
             dump_single_table,
-            import_dump
+            import_dump,
+            dump_parallel,
+            get_settings,
+            save_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
