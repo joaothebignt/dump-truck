@@ -365,6 +365,7 @@ textarea {
 }
 
 .btn {
+  --btn-accent: #3a7afe;
   border-radius: 999px;
   border: 1px solid #27272a;
   background: #050816;
@@ -381,10 +382,14 @@ textarea {
 }
 
 .btn--primary {
-  border-color: #3a7afe;
-  background: linear-gradient(135deg, #1d4ed8, #3b82f6);
+  border-color: var(--btn-accent);
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--btn-accent) 82%, #020617 18%),
+    color-mix(in srgb, var(--btn-accent) 92%, #38bdf8 8%)
+  );
   color: #f9fafb;
-  box-shadow: 0 10px 30px rgba(37, 99, 235, 0.45);
+  box-shadow: 0 10px 30px color-mix(in srgb, var(--btn-accent) 65%, transparent);
 }
 
 .btn--ghost {
@@ -398,13 +403,17 @@ textarea {
 
 .btn:hover:not(:disabled) {
   background: #020617;
-  border-color: #3a7afe;
-  box-shadow: 0 12px 40px rgba(37, 99, 235, 0.5);
+  border-color: var(--btn-accent);
+  box-shadow: 0 12px 40px color-mix(in srgb, var(--btn-accent) 70%, transparent);
   transform: translateY(-0.5px);
 }
 
 .btn--primary:hover:not(:disabled) {
-  background: linear-gradient(135deg, #2563eb, #60a5fa);
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--btn-accent) 90%, #020617 10%),
+    color-mix(in srgb, var(--btn-accent) 96%, #38bdf8 4%)
+  );
 }
 
 .btn:disabled {

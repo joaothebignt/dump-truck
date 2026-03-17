@@ -21,10 +21,11 @@ const form = reactive({
   port: 3306,
   username: "",
   password: "",
-  color: "#3a7afe",
-  saveFavorite: false
+  color: "#3a7afe"
 
 })
+
+const showPassword = ref(false)
 
 onMounted(() => {
 
@@ -43,7 +44,6 @@ onMounted(() => {
       form.username = existing.username
       form.password = existing.password
       form.color = existing.color || "#3a7afe"
-      form.saveFavorite = true
 
     }
   }
@@ -78,7 +78,19 @@ function save() {
 
     store.update(editingIndex.value, { ...form })
 
-  } else if (form.saveFavorite) {
+  }
+
+  router.push("/")
+
+}
+
+function saveAndFavorite() {
+
+  if (editingIndex.value !== null) {
+
+    store.update(editingIndex.value, { ...form })
+
+  } else {
 
     store.add({ ...form })
 
@@ -115,22 +127,21 @@ function save() {
           />
         </label>
 
-        <label class="field">
-          <span class="field-label">Host</span>
-          <input
-            v-model="form.host"
-            class="field-input"
-            placeholder="Ex.: 192.168.0.10"
-          />
-        </label>
-
-        <label class="field field--small">
-          <span class="field-label">Porta</span>
-          <input
-            v-model="form.port"
-            class="field-input"
-            placeholder="3306"
-          />
+        <label class="field field--host-port">
+          <span class="field-label">Host e porta</span>
+          <div class="host-port-wrapper">
+            <input
+              v-model="form.host"
+              class="field-input host-input"
+              placeholder="Ex.: 192.168.0.10"
+            />
+            <span class="host-port-separator">:</span>
+            <input
+              v-model="form.port"
+              class="field-input port-input"
+              placeholder="3306"
+            />
+          </div>
         </label>
 
         <label class="field">
@@ -144,12 +155,21 @@ function save() {
 
         <label class="field">
           <span class="field-label">Senha</span>
-          <input
-            type="password"
-            v-model="form.password"
-            class="field-input"
-            placeholder="Digite a senha"
-          />
+          <div class="password-wrapper">
+            <input
+              :type="showPassword ? 'text' : 'password'"
+              v-model="form.password"
+              class="field-input"
+              placeholder="Digite a senha"
+            />
+            <button
+              type="button"
+              class="password-toggle"
+              @click="showPassword = !showPassword"
+            >
+              {{ showPassword ? "Ocultar" : "Mostrar" }}
+            </button>
+          </div>
         </label>
 
         <label class="field field--small">
@@ -162,14 +182,6 @@ function save() {
         </label>
       </div>
 
-      <label class="favorite-toggle">
-        <input
-          v-model="form.saveFavorite"
-          type="checkbox"
-        >
-        <span>Salvar como favorita</span>
-      </label>
-
       <div
         v-if="testMessage"
         :class="['test-message', testMessage.ok ? 'success' : 'error']"
@@ -180,23 +192,29 @@ function save() {
       <div class="actions">
         <button
           class="btn btn--ghost"
-          @click="router.push('/')"
+          @click="testConnection"
+          :disabled="testing"
         >
-          Cancelar
+          {{ testing ? "Testando…" : "Testar conexão" }}
         </button>
         <div class="actions-right">
-          <button
-            class="btn btn--ghost"
-            @click="testConnection"
-            :disabled="testing"
-          >
-            {{ testing ? "Testando…" : "Testar conexão" }}
-          </button>
           <button
             class="btn btn--primary"
             @click="save"
           >
             Salvar
+          </button>
+          <button
+            class="btn btn--ghost"
+            @click="saveAndFavorite"
+          >
+            Salvar e favoritar
+          </button>
+          <button
+            class="btn btn--ghost"
+            @click="router.push('/')"
+          >
+            Cancelar
           </button>
         </div>
       </div>
@@ -256,6 +274,61 @@ function save() {
   color: #9ca3af;
 }
 
+.field--host-port {
+  grid-column: span 2;
+}
+
+.host-port-wrapper {
+  display: flex;
+  align-items: stretch;
+  border-radius: 999px;
+  border: 1px solid #27272a;
+  background: #020617;
+  overflow: hidden;
+}
+
+.host-input,
+.port-input {
+  border: none;
+  background: transparent;
+  padding: 8px 12px;
+}
+
+.host-input {
+  flex: 1;
+}
+
+.port-input {
+  width: 96px;
+  text-align: center;
+}
+
+.host-port-separator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+  font-size: 13px;
+  color: #6b7280;
+}
+
+.password-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.password-toggle {
+  position: absolute;
+  right: 10px;
+  background: transparent;
+  border: none;
+  color: #9ca3af;
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0;
+}
+
 .field--small {
   max-width: 180px;
 }
@@ -268,19 +341,6 @@ function save() {
   width: 100%;
   height: 36px;
   cursor: pointer;
-}
-
-.favorite-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 16px;
-  font-size: 13px;
-  color: #e5e7eb;
-}
-
-.favorite-toggle input {
-  margin: 0;
 }
 
 .test-message {

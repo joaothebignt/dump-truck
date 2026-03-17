@@ -232,6 +232,11 @@ async function connect(connection) {
 }
 
 .home-empty {
+  width: 100vw;
+  height: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
   margin-top: 40px;
   border-radius: 20px;
   border: 1px dashed #27272a;
@@ -389,6 +394,33 @@ async function connect(connection) {
   padding-inline: 10px;
   padding-block: 6px;
   font-size: 13px;
+}
+
+.connection-card .btn--ghost {
+  position: relative;
+  --btn-accent: var(--accent, #3a7afe);
+  border-color: color-mix(in srgb, var(--accent, #3a7afe) 70%, #020617 30%);
+  color: color-mix(in srgb, var(--accent, #3a7afe) 86%, #e5e7eb 14%);
+}
+
+.connection-card .btn--ghost::before {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: inherit;
+  background: radial-gradient(
+    circle at center,
+    color-mix(in srgb, var(--accent, #3a7afe) 70%, transparent) 0,
+    transparent 70%
+  );
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+
+.connection-card .btn--ghost:hover::before,
+.connection-card .btn--ghost:focus-visible::before {
+  opacity: 0.75;
 }
 
 .connection-remove {
