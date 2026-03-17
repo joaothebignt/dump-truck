@@ -22,6 +22,8 @@ pub struct DumpTableRequest {
     pub structure: bool,
     pub content: bool,
     pub drop: bool,
+    #[serde(default)]
+    pub size: u64,
 }
 
 #[derive(Serialize, Clone)]

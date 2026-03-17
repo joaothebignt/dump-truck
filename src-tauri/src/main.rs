@@ -3,13 +3,21 @@ mod dump;
 mod models;
 mod settings;
 
+const PAGE_SIZE: usize = 1000;
+
 use sqlx::MySqlPool;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 use db::*;
+
+fn config_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map_err(|e| format!("Não foi possível resolver o diretório de configuração: {}", e))
+}
 
 /// Valida se o diretório existe e tem permissão de escrita
 fn validate_dump_directory(dir: &std::path::Path) -> Result<(), String> {
@@ -88,14 +96,27 @@ async fn databases(conn: String) -> Result<Vec<String>, String> {
 
 #[tauri::command]
 async fn tables_with_size(
+    app: tauri::AppHandle,
     conn: String,
     database: String,
 ) -> Result<Vec<models::TableInfo>, String> {
     let pool = create_pool(&conn).await.map_err(|e| e.to_string())?;
 
-    let tables = list_tables_with_size(&pool, &database)
+    let cfg = settings::load(&config_dir(&app)?);
+    let exclude = &cfg.table_exclude_patterns;
+
+    let all_tables = list_tables_with_size(&pool, &database)
         .await
         .map_err(|e| e.to_string())?;
+
+    let tables = if exclude.is_empty() {
+        all_tables
+    } else {
+        all_tables
+            .into_iter()
+            .filter(|t| !db::should_exclude_table(&t.name, exclude))
+            .collect()
+    };
 
     Ok(tables)
 }
@@ -123,9 +144,10 @@ async fn dump_tables(
             structure: true,
             content: true,
             drop: false,
+            size: 0,
         };
 
-        let table_sql = dump::dump_one_table_to_string(&pool, &database, &request).await?;
+        let table_sql = dump::dump_one_table_to_string(&pool, &database, &request, PAGE_SIZE).await?;
 
         if !sql_output.is_empty() {
             sql_output.push_str("\n\n");
@@ -159,10 +181,11 @@ async fn dump_single_table(
         structure,
         content,
         drop,
+        size: 0,
     };
 
     // Gerar SQL usando função nativa
-    dump::dump_one_table_to_string(&pool, &database, &request).await
+    dump::dump_one_table_to_string(&pool, &database, &request, PAGE_SIZE).await
 }
 
 /// Parser simples de SQL que divide em statements respeitando strings
@@ -276,13 +299,18 @@ async fn dump_parallel(
     let pool = Arc::new(pool);
 
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
-    let output_dir = dump::create_dump_dir(&timestamp)?;
+    let cfg_dir = config_dir(&app)?;
+    let output_dir = dump::create_dump_dir(&timestamp, &cfg_dir)?;
 
     // Validar diretório antes de iniciar dumps paralelos
     validate_dump_directory(&output_dir)?;
 
+    // Ordenar tabelas por tamanho (leves primeiro, pesadas por último)
+    let mut tables: Vec<_> = tables.into_iter().collect();
+    tables.sort_by_key(|t| t.size);
+
     let total = tables.len();
-    let cfg = settings::load();
+    let cfg = settings::load(&config_dir(&app)?);
     let parallel_limit = cfg.max_parallel_dumps.max(1);
     let semaphore = Arc::new(Semaphore::new(parallel_limit));
     let mut handles = Vec::with_capacity(total);
@@ -297,6 +325,7 @@ async fn dump_parallel(
         let handle = tokio::spawn(async move {
             let permit = sem.acquire_owned().await.map_err(|e| e.to_string())?;
             let table_name = table.name.clone();
+            let app_h = app_handle.clone();
 
             let _ = app_handle.emit(
                 "dump-progress",
@@ -309,14 +338,36 @@ async fn dump_parallel(
                 },
             );
 
-            let result = dump::dump_one_table(&pool, &database, &table, &output_dir).await;
+            let result = dump::dump_one_table(
+                &pool,
+                &database,
+                &table,
+                &output_dir,
+                PAGE_SIZE,
+                cfg.parallel_chunk_threshold,
+                cfg.chunk_size,
+                cfg.max_parallel_dumps,
+                move |rows_processed, total_rows| {
+                    let _ = app_h.emit(
+                        "dump-progress",
+                        models::DumpProgress {
+                            table: table_name.clone(),
+                            status: "dumping".to_string(),
+                            completed: rows_processed as usize,
+                            total: total_rows as usize,
+                            error: None,
+                        },
+                    );
+                },
+            ).await;
             drop(permit); // Liberar semáforo após concluir
 
+            let table_name_result = table.name.clone();
             let (status, error) = match &result {
                 Ok(_) => ("done".to_string(), None),
                 Err(e) => ("error".to_string(), Some(e.clone())),
             };
-            Ok::<_, String>((table_name, status, error, result.map(|_| ())))
+            Ok::<_, String>((table_name_result, status, error, result.map(|_| ())))
         });
 
         handles.push(handle);
@@ -390,13 +441,13 @@ async fn dump_parallel(
 }
 
 #[tauri::command]
-fn get_settings() -> settings::AppSettings {
-    settings::load()
+fn get_settings(app: tauri::AppHandle) -> Result<settings::AppSettings, String> {
+    Ok(settings::load(&config_dir(&app)?))
 }
 
 #[tauri::command]
-fn save_settings(s: settings::AppSettings) -> Result<(), String> {
-    settings::save(&s)
+fn save_settings(app: tauri::AppHandle, s: settings::AppSettings) -> Result<(), String> {
+    settings::save(&config_dir(&app)?, &s)
 }
 
 fn main() {
