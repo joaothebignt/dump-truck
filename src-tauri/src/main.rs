@@ -8,7 +8,10 @@ use std::process::{Command, Stdio};
 use db::*;
 
 fn parse_mysql_conn(conn: &str) -> Result<(String, u16, String, String), String> {
-    // expected format: mysql://user:pass@host:port/
+    // formatos aceitos:
+    // - mysql://user:pass@host:port/
+    // - mysql://user:pass@host:port/dbname
+    // - mysql://user:pass@host:port/?charset=...
     let without_scheme = conn
         .strip_prefix("mysql://")
         .ok_or_else(|| "invalid mysql connection string".to_string())?;
@@ -21,9 +24,15 @@ fn parse_mysql_conn(conn: &str) -> Result<(String, u16, String, String), String>
         .split_once(':')
         .ok_or_else(|| "invalid mysql connection string".to_string())?;
 
+    // remove possíveis partes após o host:port (path ou query), ex:
+    // host:3306/dbname ou host:3306/?charset=utf8mb4
     let host_part = host_part.trim_end_matches('/');
+    let host_port = host_part
+        .split_once('/')
+        .map(|(hp, _)| hp)
+        .unwrap_or(host_part);
 
-    let (host, port_str) = host_part
+    let (host, port_str) = host_port
         .split_once(':')
         .ok_or_else(|| "invalid mysql connection string".to_string())?;
 
@@ -36,7 +45,23 @@ fn parse_mysql_conn(conn: &str) -> Result<(String, u16, String, String), String>
 
 #[tauri::command]
 async fn connect_db(host: String, port: u16, user: String, pass: String) -> Result<String, String> {
-    let conn = format!("mysql://{}:{}@{}:{}/", user, pass, host, port);
+    // Permitir tanto:
+    // - host/domínio simples: "db.dominio.com.br"
+    // - URL completa: "mysql://user:pass@host:port/" ou ".../dbname?charset=..."
+    // Sempre garantimos charset explícito para evitar problemas de UTF‑8.
+    let mut conn = if host.starts_with("mysql://") {
+        host
+    } else {
+        format!("mysql://{}:{}@{}:{}/", user, pass, host, port)
+    };
+
+    if !conn.contains("charset=") {
+        if conn.contains('?') {
+            conn.push_str("&charset=utf8mb4");
+        } else {
+            conn.push_str("?charset=utf8mb4");
+        }
+    }
 
     MySqlPool::connect(&conn).await.map_err(|e| e.to_string())?;
 

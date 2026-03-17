@@ -13,6 +13,8 @@ const filter = ref("")
 
 const loading = ref(false)
 const importing = ref(false)
+const importCancelled = ref(false)
+const importFileName = ref("")
 
 const sortKey = ref("name")
 const sortAsc = ref(true)
@@ -74,7 +76,7 @@ async function loadDatabases(){
   try{
 
     const dbs = await invoke("databases",{
-      conn: store.connection
+      conn: store.connection.url || store.connection
     })
 
     store.databases = dbs
@@ -100,7 +102,7 @@ async function loadTables(){
 
     const tables = await invoke("tables_with_size",{
 
-      conn: store.connection,
+      conn: store.connection.url || store.connection,
 
       database: store.selectedDatabase
 
@@ -142,17 +144,21 @@ async function importDump(){
     return
 
   importing.value = true
+  importCancelled.value = false
+  importFileName.value = typeof path === "string" ? path.split(/[\\/]/).pop() || "" : ""
 
   try{
 
     await invoke("import_dump", {
-      conn: store.connection,
+      conn: store.connection.url || store.connection,
       database: store.selectedDatabase,
       path
     })
 
-    alert("Dump importado com sucesso.")
-    loadTables()
+    if (!importCancelled.value) {
+      alert("Dump importado com sucesso.")
+      loadTables()
+    }
 
   }catch(e){
 
@@ -161,6 +167,13 @@ async function importDump(){
 
   }
 
+  importing.value = false
+
+}
+
+function cancelImport(){
+
+  importCancelled.value = true
   importing.value = false
 
 }
@@ -230,193 +243,218 @@ watch(
 
 <template>
 
-<div class="database-page">
-
-  <div class="toolbar">
-
-    <select
-      v-model="store.selectedDatabase"
-      @change="loadTables"
+  <div class="database-page">
+    <div
+      v-if="store.selectedDatabase"
+      class="database-controls-row"
     >
-
-      <option
-        v-for="db in store.databases"
-        :key="db"
-        :value="db"
+      <input
+        class="field-input database-search"
+        v-model="filter"
+        placeholder="Buscar tabelas..."
       >
-        {{db}}
-      </option>
 
-    </select>
+      <button
+        type="button"
+        class="btn btn--ghost"
+        title="Atualizar lista de tabelas"
+        :disabled="!store.connection || !store.selectedDatabase || loading"
+        @click="loadTables"
+      >
+        <i class="ri-refresh-line"></i>
+        <span>Atualizar tabelas</span>
+      </button>
 
-    <button
-      type="button"
-      class="btn-refresh"
-      title="Atualizar lista de bancos"
-      :disabled="!store.connection || loading"
-      @click="loadDatabases"
-    >
-      Atualizar bancos
-    </button>
+      <DumpExport
+        :tables="filteredTables"
+      />
 
-    <button
-      type="button"
-      class="btn-refresh"
-      title="Atualizar lista de tabelas"
-      :disabled="!store.connection || !store.selectedDatabase || loading"
-      @click="loadTables"
-    >
-      Atualizar tabelas
-    </button>
+      <button
+        type="button"
+        class="btn btn--primary"
+        title="Importar arquivo .sql no banco selecionado"
+        :disabled="!store.connection || !store.selectedDatabase || loading || importing"
+        @click="importDump"
+      >
+        <i class="ri-download-2-line"></i>
+        <span>{{ importing ? "Importando..." : "Importar" }}</span>
+      </button>
+    </div>
 
-    <button
-      type="button"
-      class="btn-import"
-      title="Importar arquivo .sql no banco selecionado"
-      :disabled="!store.connection || !store.selectedDatabase || loading || importing"
-      @click="importDump"
-    >
-      {{ importing ? "Importando..." : "Importar dump" }}
-    </button>
+    <div class="database-main">
+      <div
+        v-if="!store.selectedDatabase"
+        class="database-dbs-container"
+      >
+        <div class="database-dbs-header">
+          <div class="database-dbs-title-group">
+            <h2 class="database-dbs-title">
+              {{ store.connection?.name || 'Conexão sem nome' }}
+            </h2>
+            <p class="database-dbs-subtitle">
+              {{ store.databases.length || 0 }} databases disponíveis
+            </p>
+          </div>
+        </div>
 
-    <input
-      v-model="filter"
-      placeholder="Filtrar tabelas..."
-    >
-
-    <DumpExport :tables="filteredTables" />
-
-    <span
-      v-if="store.tables && store.tables.length"
-      class="summary summary--inline"
-    >
-      <template v-if="selectedSummary.count">
-        {{ selectedSummary.count }} tabelas:
-        {{ formatSize(selectedSummary.bytes) }}
-      </template>
-      <template v-else>
-        Nenhuma tabela selecionada
-      </template>
-    </span>
-
-  </div>
-
-  <div v-if="loading">
-    <div class="loading">
-      <div class="progress-bar">
-        <div class="progress-bar-inner"></div>
+        <div class="database-dbs-grid">
+          <div
+            v-for="db in store.databases"
+            :key="db"
+            class="database-card"
+            :style="{ '--accent': store.connection?.color || '#3a7afe' }"
+            @click="store.selectedDatabase = db; loadTables()"
+          >
+            <div class="database-card-badge">
+              <span class="database-status-badge">
+                Database
+              </span>
+            </div>
+            <div class="database-card-body">
+              <div class="database-card-name">
+                {{ db }}
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
-      <span>Carregando tabelas...</span>
+
+      <div v-else class="database-table-area">
+        <div v-if="loading" class="loading">
+          <div class="progress-bar">
+            <div class="progress-bar-inner"></div>
+          </div>
+          <span>Carregando tabelas...</span>
+        </div>
+
+        <div
+          v-if="!loading"
+          class="table-container"
+        >
+          <table>
+            <thead>
+              <tr>
+                <th
+                  class="sortable"
+                  @click="toggleSort('name')"
+                >
+                  Tabela
+                </th>
+                <th
+                  class="sortable"
+                  @click="toggleSort('size')"
+                >
+                  Tamanho
+                </th>
+                <th class="col-action">
+                  <input
+                    type="checkbox"
+                    title="Structure"
+                    :checked="filteredTables.length && filteredTables.every(t => t.structure)"
+                    @change="toggleAll('structure')"
+                  >
+                  S
+                </th>
+                <th class="col-action">
+                  <input
+                    type="checkbox"
+                    title="Content"
+                    :checked="filteredTables.length && filteredTables.every(t => t.content)"
+                    @change="toggleAll('content')"
+                  >
+                  C
+                </th>
+                <th class="col-action">
+                  <input
+                    type="checkbox"
+                    title="Drop"
+                    :checked="filteredTables.length && filteredTables.every(t => t.drop)"
+                    @change="toggleAll('drop')"
+                  >
+                  D
+                </th>
+              </tr>
+            </thead>
+
+            <tbody>
+              <tr
+                v-for="t in filteredTables"
+                :key="t.name"
+              >
+                <td>{{ t.name }}</td>
+                <td>{{ formatSize(t.size) }}</td>
+                <td class="col-action">
+                  <input
+                    type="checkbox"
+                    v-model="t.structure"
+                  >
+                </td>
+                <td class="col-action">
+                  <input
+                    type="checkbox"
+                    v-model="t.content"
+                  >
+                </td>
+                <td class="col-action">
+                  <input
+                    type="checkbox"
+                    v-model="t.drop"
+                  >
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div
+          v-if="store.tables && store.tables.length"
+          class="summary"
+        >
+          <template v-if="selectedSummary.count">
+            {{ selectedSummary.count }} tabelas:
+            {{ formatSize(selectedSummary.bytes) }}
+          </template>
+          <template v-else>
+            Nenhuma tabela selecionada
+          </template>
+        </div>
+      </div>
     </div>
   </div>
 
   <div
-    v-if="!loading"
-    class="table-container"
+    v-if="importing"
+    class="import-floating-toolbar"
   >
+    <div class="import-floating-main">
+      <div class="import-floating-info">
+        <span class="import-floating-label">
+          Importando:
+        </span>
+        <span class="import-floating-table">
+          {{ importFileName || 'Processando arquivo...' }}
+        </span>
+      </div>
 
-    <table>
+      <div class="import-floating-progress">
+        <div class="import-floating-progress-bar">
+          <div class="import-floating-progress-bar-inner" />
+        </div>
+        <span class="import-floating-status">
+          Aguardando conclusão...
+        </span>
+      </div>
+    </div>
 
-      <thead>
-
-      <tr>
-        <th
-          class="sortable"
-          @click="toggleSort('name')"
-        >
-          Tabela
-        </th>
-        <th
-          class="sortable"
-          @click="toggleSort('size')"
-        >
-          Tamanho
-        </th>
-        <th class="col-action">
-          <input
-            type="checkbox"
-            title="Structure"
-            :checked="filteredTables.length && filteredTables.every(t => t.structure)"
-            @change="toggleAll('structure')"
-          >
-          S
-        </th>
-        <th class="col-action">
-          <input
-            type="checkbox"
-            title="Content"
-            :checked="filteredTables.length && filteredTables.every(t => t.content)"
-            @change="toggleAll('content')"
-          >
-          C
-        </th>
-        <th class="col-action">
-          <input
-            type="checkbox"
-            title="Drop"
-            :checked="filteredTables.length && filteredTables.every(t => t.drop)"
-            @change="toggleAll('drop')"
-          >
-          D
-        </th>
-      </tr>
-
-      </thead>
-
-      <tbody>
-
-        <tr
-          v-for="t in filteredTables"
-          :key="t.name"
-        >
-
-          <td>{{t.name}}</td>
-
-          <td>{{formatSize(t.size)}}</td>
-
-          <td class="col-action">
-            <input
-              type="checkbox"
-              v-model="t.structure"
-            >
-          </td>
-
-          <td class="col-action">
-            <input
-              type="checkbox"
-              v-model="t.content"
-            >
-          </td>
-
-          <td class="col-action">
-            <input
-              type="checkbox"
-              v-model="t.drop"
-            >
-          </td>
-
-        </tr>
-
-      </tbody>
-
-    </table>
-
+    <button
+      type="button"
+      class="import-floating-cancel"
+      title="Cancelar importação"
+      @click="cancelImport"
+    >
+      <i class="ri-close-line"></i>
+    </button>
   </div>
-
-  <div
-    v-if="store.tables && store.tables.length"
-    class="summary"
-  >
-    <template v-if="selectedSummary.count">
-      {{ selectedSummary.count }} tabelas:
-      {{ formatSize(selectedSummary.bytes) }}
-    </template>
-    <template v-else>
-      Nenhuma tabela selecionada
-    </template>
-  </div>
-
-</div>
 
 </template>
 
@@ -429,80 +467,180 @@ watch(
   min-height:0;
 }
 
-.toolbar{
-  display:flex;
-  flex-wrap:wrap;
-  align-items:center;
-  gap:10px;
-  margin-bottom:15px;
+.database-controls-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  gap: 10px;
+  margin-bottom: 16px;
 }
 
-select,input{
-  padding:6px;
+.database-search {
+  width: 100%;
 }
 
-.btn-refresh{
-  padding:6px 10px;
-  font-size:13px;
-  border:1px solid #ccc;
-  border-radius:4px;
-  background:#fff;
-  cursor:pointer;
+.database-main {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 
-.btn-refresh:hover:not(:disabled){
-  background:#f0f0f0;
+.database-dbs-container {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
-.btn-refresh:disabled{
-  opacity:0.6;
-  cursor:not-allowed;
+.database-dbs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
 }
 
-.btn-import{
-  padding:6px 10px;
-  font-size:13px;
-  border:1px solid #0a7;
-  border-radius:4px;
-  background:#e8f8f5;
-  color:#057;
-  cursor:pointer;
+.database-dbs-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
-.btn-import:hover:not(:disabled){
-  background:#d0f0eb;
+.database-dbs-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 500;
 }
 
-.btn-import:disabled{
-  opacity:0.6;
-  cursor:not-allowed;
+.database-dbs-subtitle {
+  margin: 0;
+  font-size: 12px;
+  color: #9ca3af;
 }
 
-table{
-  width:100%;
-  border-collapse:collapse;
-  background:white;
+.database-dbs-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-auto-rows: minmax(120px, 1fr);
+  gap: 16px;
+  align-content: flex-start;
 }
 
-th,td{
-  border:1px solid #ddd;
-  padding:6px;
+.database-card {
+  position: relative;
+  border-radius: 18px;
+  padding: 14px 14px 12px;
+  background:
+    radial-gradient(
+      circle at top left,
+      color-mix(in srgb, var(--accent, #3a7afe) 32%, transparent) 0,
+      transparent 60%
+    ),
+    radial-gradient(
+      circle at bottom right,
+      color-mix(in srgb, var(--accent, #3a7afe) 18%, transparent) 0,
+      transparent 65%
+    ),
+    linear-gradient(
+      135deg,
+      rgba(15, 23, 42, 0.96),
+      rgba(15, 23, 42, 1)
+    );
+  box-shadow:
+    0 18px 40px rgba(0, 0, 0, 0.75),
+    0 0 0 1px rgba(39, 39, 42, 0.8);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  opacity: 1;
+  transition: transform 0.12s ease, box-shadow 0.12s ease,
+    opacity 0.12s ease, border-color 0.12s ease, background 0.12s ease;
+  border: 1px solid color-mix(in srgb, var(--accent, #3a7afe) 70%, #020617 30%);
 }
 
-th{
-  background:#f5f5f5;
-  position:sticky;
-  top:0;
-  z-index:1;
-  box-shadow:0 1px 0 #ddd;
+.database-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(
+    circle at top left,
+    color-mix(in srgb, var(--accent, #3a7afe) 35%, transparent),
+    transparent
+  );
+  opacity: 0.5;
+  pointer-events: none;
 }
 
-.sortable{
-  cursor:pointer;
+.database-card:hover {
+  transform: translateY(-2px);
+  box-shadow:
+    0 24px 60px rgba(0, 0, 0, 0.85),
+    0 0 0 1px rgba(37, 99, 235, 0.8);
 }
 
-.sortable:hover{
-  text-decoration:underline;
+.database-card-badge {
+  display: flex;
+  align-items: center;
+}
+
+.database-status-badge {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid #27272a;
+  color: #e5e7eb;
+  background: rgba(31, 41, 55, 0.9);
+}
+
+.database-card-body {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  flex: 1;
+  padding-top: 12px;
+}
+
+.database-card-name {
+  font-size: 18px;
+  font-weight: 600;
+  color: #f9fafb;
+  word-break: break-all;
+}
+
+.database-table-area {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.database-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.database-empty-card {
+  padding: 28px 24px;
+  border-radius: 18px;
+  border: 1px dashed #27272a;
+  background: radial-gradient(circle at top left, #020617, #020617);
+  max-width: 420px;
+}
+
+.database-empty-title {
+  margin: 0 0 8px;
+  font-size: 18px;
+  font-weight: 500;
+}
+
+.database-empty-text {
+  margin: 0;
+  font-size: 13px;
+  color: #9ca3af;
 }
 
 .loading{
@@ -532,7 +670,7 @@ th{
 .summary{
   margin-top:8px;
   font-size:13px;
-  color:#444;
+  color:#9ca3af;
 }
 
 .summary--inline{
@@ -544,7 +682,14 @@ th{
   flex:1;
   min-height:0;
   overflow-y:auto;
-  border-radius:4px;
+  border-radius:12px;
+  border: 1px solid #111827;
+}
+
+thead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
 }
 
 .col-action{
@@ -557,6 +702,103 @@ th{
   0%{ transform:translateX(-100%); }
   50%{ transform:translateX(0%); }
   100%{ transform:translateX(100%); }
+}
+
+.import-floating-toolbar{
+  position: fixed;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  min-width: 420px;
+  max-width: 480px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.95);
+  border: 1px solid #27272a;
+  box-shadow:
+    0 18px 40px rgba(0, 0, 0, 0.8),
+    0 0 0 1px rgba(15, 23, 42, 0.9);
+  color: #e5e7eb;
+  z-index: 50;
+}
+
+.import-floating-main{
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.import-floating-info{
+  display: flex;
+  flex-direction: row;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.import-floating-label{
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: #9ca3af;
+}
+
+.import-floating-table{
+  font-size: 13px;
+  font-weight: 500;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.import-floating-progress{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.import-floating-progress-bar{
+  flex: 1;
+  height: 4px;
+  background: linear-gradient(
+    90deg,
+    rgba(15, 23, 42, 0.9),
+    rgba(15, 23, 42, 0.7)
+  );
+  border-radius:999px;
+  overflow:hidden;
+}
+
+.import-floating-progress-bar-inner{
+  width: 40%;
+  height:100%;
+  background:#3a7afe;
+  border-radius:999px;
+  animation: progress-pulse 1s infinite ease-in-out;
+}
+
+.import-floating-status{
+  font-size: 12px;
+  color: #e5e7eb;
+}
+
+.import-floating-cancel{
+  border-radius: 999px;
+  border: 1px solid #4b5563;
+  background: #020617;
+  color: #e5e7eb;
+  padding: 4px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 </style>
