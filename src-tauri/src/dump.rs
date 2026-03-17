@@ -4,6 +4,96 @@ use std::path::{Path, PathBuf};
 use crate::models::DumpTableRequest;
 use sqlx::{MySqlPool, Row};
 
+/// Formata um valor SQL baseado no tipo da coluna
+fn format_sql_value(row: &sqlx::mysql::MySqlRow, col_idx: usize, data_type: &str) -> Result<String, String> {
+    // Normalizar tipo para lowercase
+    let dt = data_type.to_lowercase();
+
+    // Tipos numéricos inteiros
+    if dt.contains("int") || dt.contains("serial") {
+        // Tentar ler como i64
+        if let Ok(Some(val)) = row.try_get::<Option<i64>, _>(col_idx) {
+            return Ok(val.to_string());
+        } else if let Ok(None) = row.try_get::<Option<i64>, _>(col_idx) {
+            return Ok("NULL".to_string());
+        }
+        // Fallback para u64 (para unsigned)
+        if let Ok(Some(val)) = row.try_get::<Option<u64>, _>(col_idx) {
+            return Ok(val.to_string());
+        } else if let Ok(None) = row.try_get::<Option<u64>, _>(col_idx) {
+            return Ok("NULL".to_string());
+        }
+    }
+
+    // Tipos numéricos decimais
+    if dt.contains("float") || dt.contains("double") || dt.contains("decimal") || dt.contains("numeric") {
+        if let Ok(Some(val)) = row.try_get::<Option<f64>, _>(col_idx) {
+            return Ok(val.to_string());
+        } else if let Ok(None) = row.try_get::<Option<f64>, _>(col_idx) {
+            return Ok("NULL".to_string());
+        }
+    }
+
+    // Tipos de data/hora
+    if dt.contains("date") || dt.contains("time") || dt.contains("year") {
+        if let Ok(Some(val)) = row.try_get::<Option<String>, _>(col_idx) {
+            let escaped = val
+                .replace('\\', "\\\\")
+                .replace('\'', "\\'");
+            return Ok(format!("'{}'", escaped));
+        } else if let Ok(None) = row.try_get::<Option<String>, _>(col_idx) {
+            return Ok("NULL".to_string());
+        }
+    }
+
+    // Tipos binários (blob, binary, varbinary)
+    if dt.contains("blob") || dt.contains("binary") {
+        if let Ok(Some(bytes)) = row.try_get::<Option<Vec<u8>>, _>(col_idx) {
+            return Ok(format!("0x{}", hex::encode(bytes)));
+        } else if let Ok(None) = row.try_get::<Option<Vec<u8>>, _>(col_idx) {
+            return Ok("NULL".to_string());
+        }
+    }
+
+    // Tipos de texto e outros (varchar, char, text, json, enum, set, etc)
+    // Tentar como String primeiro
+    if let Ok(Some(val)) = row.try_get::<Option<String>, _>(col_idx) {
+        let escaped = val
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\0', "\\0");
+        return Ok(format!("'{}'", escaped));
+    } else if let Ok(None) = row.try_get::<Option<String>, _>(col_idx) {
+        return Ok("NULL".to_string());
+    }
+
+    // Fallback: tentar como bytes
+    if let Ok(Some(bytes)) = row.try_get::<Option<Vec<u8>>, _>(col_idx) {
+        // Tentar converter para string UTF-8
+        match String::from_utf8(bytes.clone()) {
+            Ok(s) => {
+                let escaped = s
+                    .replace('\\', "\\\\")
+                    .replace('\'', "\\'")
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r")
+                    .replace('\0', "\\0");
+                Ok(format!("'{}'", escaped))
+            }
+            Err(_) => {
+                // Dados binários
+                Ok(format!("0x{}", hex::encode(bytes)))
+            }
+        }
+    } else if let Ok(None) = row.try_get::<Option<Vec<u8>>, _>(col_idx) {
+        Ok("NULL".to_string())
+    } else {
+        Err(format!("Não foi possível ler valor da coluna {} (tipo: {})", col_idx, data_type))
+    }
+}
+
 /// Tenta criar e validar um diretório com teste de escrita
 fn try_create_and_validate_dir(path: &PathBuf) -> Result<PathBuf, String> {
     // 1. Criar diretório
@@ -197,9 +287,9 @@ pub async fn dump_one_table(
 
     // Dados se solicitado
     if table.content {
-        // Primeiro, obter as colunas da tabela
+        // Obter colunas e seus tipos
         let columns_query = format!(
-            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS \
+            "SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS \
              WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' \
              ORDER BY ORDINAL_POSITION",
             database, table.name
@@ -211,11 +301,16 @@ pub async fn dump_one_table(
             .map_err(|e| format!("Erro ao obter colunas da tabela '{}': {}", table.name, e))?;
 
         if !column_rows.is_empty() {
-            let columns: Vec<String> = column_rows
+            let columns: Vec<(String, String)> = column_rows
                 .iter()
-                .map(|row| row.try_get::<String, _>(0))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Erro ao ler nomes de colunas: {}", e))?;
+                .map(|row| {
+                    Ok((
+                        row.try_get::<String, _>(0)?,
+                        row.try_get::<String, _>(1)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, sqlx::Error>>()
+                .map_err(|e| format!("Erro ao ler info de colunas: {}", e))?;
 
             // Buscar todos os dados
             let data_query = format!("SELECT * FROM `{}`", table.name);
@@ -225,11 +320,10 @@ pub async fn dump_one_table(
                 .map_err(|e| format!("Erro ao obter dados da tabela '{}': {}", table.name, e))?;
 
             if !data_rows.is_empty() {
-                // Gerar INSERTs em batch (múltiplos valores por INSERT)
                 let batch_size = 100;
                 let column_list = columns
                     .iter()
-                    .map(|c| format!("`{}`", c))
+                    .map(|(name, _)| format!("`{}`", name))
                     .collect::<Vec<_>>()
                     .join(", ");
 
@@ -239,39 +333,12 @@ pub async fn dump_one_table(
                     for (i, row) in chunk.iter().enumerate() {
                         sql_output.push_str("(");
 
-                        for (j, _col) in columns.iter().enumerate() {
+                        for (j, (_col_name, data_type)) in columns.iter().enumerate() {
                             if j > 0 {
                                 sql_output.push_str(", ");
                             }
 
-                            // Obter valor como Option<String>
-                            match row.try_get::<Option<Vec<u8>>, _>(j) {
-                                Ok(Some(bytes)) => {
-                                    // Tentar converter para string
-                                    match String::from_utf8(bytes.clone()) {
-                                        Ok(s) => {
-                                            // Escapar string SQL
-                                            let escaped = s
-                                                .replace('\\', "\\\\")
-                                                .replace('\'', "\\'")
-                                                .replace('\n', "\\n")
-                                                .replace('\r', "\\r")
-                                                .replace('\0', "\\0");
-                                            sql_output.push_str(&format!("'{}'", escaped));
-                                        }
-                                        Err(_) => {
-                                            // Dados binários - usar hex
-                                            sql_output.push_str(&format!("0x{}", hex::encode(bytes)));
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    sql_output.push_str("NULL");
-                                }
-                                Err(e) => {
-                                    return Err(format!("Erro ao ler valor da coluna: {}", e));
-                                }
-                            }
+                            sql_output.push_str(&format_sql_value(row, j, data_type)?);
                         }
 
                         sql_output.push(')');
@@ -409,9 +476,9 @@ pub async fn dump_one_table_to_string(
 
     // Dados se solicitado
     if table.content {
-        // Primeiro, obter as colunas da tabela
+        // Obter colunas e seus tipos
         let columns_query = format!(
-            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS \
+            "SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS \
              WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' \
              ORDER BY ORDINAL_POSITION",
             database, table.name
@@ -423,11 +490,16 @@ pub async fn dump_one_table_to_string(
             .map_err(|e| format!("Erro ao obter colunas da tabela '{}': {}", table.name, e))?;
 
         if !column_rows.is_empty() {
-            let columns: Vec<String> = column_rows
+            let columns: Vec<(String, String)> = column_rows
                 .iter()
-                .map(|row| row.try_get::<String, _>(0))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Erro ao ler nomes de colunas: {}", e))?;
+                .map(|row| {
+                    Ok((
+                        row.try_get::<String, _>(0)?,
+                        row.try_get::<String, _>(1)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, sqlx::Error>>()
+                .map_err(|e| format!("Erro ao ler info de colunas: {}", e))?;
 
             // Buscar todos os dados
             let data_query = format!("SELECT * FROM `{}`", table.name);
@@ -437,11 +509,10 @@ pub async fn dump_one_table_to_string(
                 .map_err(|e| format!("Erro ao obter dados da tabela '{}': {}", table.name, e))?;
 
             if !data_rows.is_empty() {
-                // Gerar INSERTs em batch (múltiplos valores por INSERT)
                 let batch_size = 100;
                 let column_list = columns
                     .iter()
-                    .map(|c| format!("`{}`", c))
+                    .map(|(name, _)| format!("`{}`", name))
                     .collect::<Vec<_>>()
                     .join(", ");
 
@@ -451,39 +522,12 @@ pub async fn dump_one_table_to_string(
                     for (i, row) in chunk.iter().enumerate() {
                         sql_output.push_str("(");
 
-                        for (j, _col) in columns.iter().enumerate() {
+                        for (j, (_col_name, data_type)) in columns.iter().enumerate() {
                             if j > 0 {
                                 sql_output.push_str(", ");
                             }
 
-                            // Obter valor como Option<String>
-                            match row.try_get::<Option<Vec<u8>>, _>(j) {
-                                Ok(Some(bytes)) => {
-                                    // Tentar converter para string
-                                    match String::from_utf8(bytes.clone()) {
-                                        Ok(s) => {
-                                            // Escapar string SQL
-                                            let escaped = s
-                                                .replace('\\', "\\\\")
-                                                .replace('\'', "\\'")
-                                                .replace('\n', "\\n")
-                                                .replace('\r', "\\r")
-                                                .replace('\0', "\\0");
-                                            sql_output.push_str(&format!("'{}'", escaped));
-                                        }
-                                        Err(_) => {
-                                            // Dados binários - usar hex
-                                            sql_output.push_str(&format!("0x{}", hex::encode(bytes)));
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    sql_output.push_str("NULL");
-                                }
-                                Err(e) => {
-                                    return Err(format!("Erro ao ler valor da coluna: {}", e));
-                                }
-                            }
+                            sql_output.push_str(&format_sql_value(row, j, data_type)?);
                         }
 
                         sql_output.push(')');
