@@ -13,6 +13,7 @@ pub struct Connection {
 pub struct TableInfo {
     pub name: String,
     pub size: u64,
+    pub is_view: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

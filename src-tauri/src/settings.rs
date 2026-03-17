@@ -6,6 +6,8 @@ pub struct AppSettings {
     pub max_parallel_dumps: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_dump_dir: Option<String>,
+    #[serde(default)]
+    pub table_exclude_patterns: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -13,6 +15,7 @@ impl Default for AppSettings {
         AppSettings {
             max_parallel_dumps: 5,
             custom_dump_dir: None,
+            table_exclude_patterns: vec![],
         }
     }
 }

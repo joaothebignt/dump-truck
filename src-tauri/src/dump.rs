@@ -4,6 +4,27 @@ use std::path::{Path, PathBuf};
 use crate::models::DumpTableRequest;
 use sqlx::{MySqlPool, Row};
 
+/// Verifica se um objeto é uma VIEW
+async fn check_if_view(pool: &MySqlPool, database: &str, table_name: &str) -> Result<bool, String> {
+    let query = "SELECT TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES \
+                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?";
+
+    let row = sqlx::query(query)
+        .bind(database)
+        .bind(table_name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("Erro ao verificar tipo de '{}': {}", table_name, e))?;
+
+    if let Some(row) = row {
+        let table_type: String = row.try_get(0)
+            .map_err(|e| format!("Erro ao ler TABLE_TYPE: {}", e))?;
+        Ok(table_type == "VIEW")
+    } else {
+        Ok(false)
+    }
+}
+
 /// Formata um valor SQL baseado no tipo da coluna
 fn format_sql_value(row: &sqlx::mysql::MySqlRow, col_idx: usize, data_type: &str) -> Result<String, String> {
     // Normalizar tipo para lowercase
@@ -242,9 +263,16 @@ pub async fn dump_one_table(
 ) -> Result<u64, String> {
     let mut sql_output = String::new();
 
+    // Verificar se é VIEW (views não devem ter dados exportados)
+    let is_view = check_if_view(pool, database, &table.name).await?;
+    let mut table_request = table.clone();
+    if is_view {
+        table_request.content = false; // Views: apenas estrutura
+    }
+
     // Se não exporta estrutura nem dados, criar arquivo vazio
-    if !table.structure && !table.content {
-        let empty_path = output_dir.join(format!("{}.sql", table.name));
+    if !table_request.structure && !table_request.content {
+        let empty_path = output_dir.join(format!("{}.sql", table_request.name));
         std::fs::write(&empty_path, b"").map_err(|e| {
             match e.kind() {
                 std::io::ErrorKind::PermissionDenied => {
@@ -266,16 +294,16 @@ pub async fn dump_one_table(
     }
 
     // DROP TABLE se solicitado
-    if table.drop {
-        sql_output.push_str(&format!("DROP TABLE IF EXISTS `{}`;\n\n", table.name));
+    if table_request.drop {
+        sql_output.push_str(&format!("DROP TABLE IF EXISTS `{}`;\n\n", table_request.name));
     }
 
     // CREATE TABLE se solicitado
-    if table.structure {
-        let create_stmt = sqlx::query(&format!("SHOW CREATE TABLE `{}`", table.name))
+    if table_request.structure {
+        let create_stmt = sqlx::query(&format!("SHOW CREATE TABLE `{}`", table_request.name))
             .fetch_one(pool)
             .await
-            .map_err(|e| format!("Erro ao obter estrutura da tabela '{}': {}", table.name, e))?;
+            .map_err(|e| format!("Erro ao obter estrutura da tabela '{}': {}", table_request.name, e))?;
 
         let create_sql: String = create_stmt
             .try_get(1)
@@ -286,19 +314,19 @@ pub async fn dump_one_table(
     }
 
     // Dados se solicitado
-    if table.content {
+    if table_request.content {
         // Obter colunas e seus tipos
         let columns_query = format!(
             "SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS \
              WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' \
              ORDER BY ORDINAL_POSITION",
-            database, table.name
+            database, table_request.name
         );
 
         let column_rows = sqlx::query(&columns_query)
             .fetch_all(pool)
             .await
-            .map_err(|e| format!("Erro ao obter colunas da tabela '{}': {}", table.name, e))?;
+            .map_err(|e| format!("Erro ao obter colunas da tabela '{}': {}", table_request.name, e))?;
 
         if !column_rows.is_empty() {
             let columns: Vec<(String, String)> = column_rows
@@ -313,11 +341,11 @@ pub async fn dump_one_table(
                 .map_err(|e| format!("Erro ao ler info de colunas: {}", e))?;
 
             // Buscar todos os dados
-            let data_query = format!("SELECT * FROM `{}`", table.name);
+            let data_query = format!("SELECT * FROM `{}`", table_request.name);
             let data_rows = sqlx::query(&data_query)
                 .fetch_all(pool)
                 .await
-                .map_err(|e| format!("Erro ao obter dados da tabela '{}': {}", table.name, e))?;
+                .map_err(|e| format!("Erro ao obter dados da tabela '{}': {}", table_request.name, e))?;
 
             if !data_rows.is_empty() {
                 let batch_size = 100;
@@ -328,7 +356,7 @@ pub async fn dump_one_table(
                     .join(", ");
 
                 for chunk in data_rows.chunks(batch_size) {
-                    sql_output.push_str(&format!("INSERT INTO `{}` ({}) VALUES\n", table.name, column_list));
+                    sql_output.push_str(&format!("INSERT INTO `{}` ({}) VALUES\n", table_request.name, column_list));
 
                     for (i, row) in chunk.iter().enumerate() {
                         sql_output.push_str("(");
@@ -354,7 +382,7 @@ pub async fn dump_one_table(
     }
 
     // Escrever arquivo
-    let file_path = output_dir.join(format!("{}.sql", table.name));
+    let file_path = output_dir.join(format!("{}.sql", table_request.name));
     std::fs::write(&file_path, sql_output.as_bytes()).map_err(|e| {
         match e.kind() {
             std::io::ErrorKind::PermissionDenied => {
@@ -449,22 +477,29 @@ pub async fn dump_one_table_to_string(
 ) -> Result<String, String> {
     let mut sql_output = String::new();
 
+    // Verificar se é VIEW (views não devem ter dados exportados)
+    let is_view = check_if_view(pool, database, &table.name).await?;
+    let mut table_request = table.clone();
+    if is_view {
+        table_request.content = false; // Views: apenas estrutura
+    }
+
     // Se não exporta estrutura nem dados, retornar vazio
-    if !table.structure && !table.content {
+    if !table_request.structure && !table_request.content {
         return Ok(String::new());
     }
 
     // DROP TABLE se solicitado
-    if table.drop {
-        sql_output.push_str(&format!("DROP TABLE IF EXISTS `{}`;\n\n", table.name));
+    if table_request.drop {
+        sql_output.push_str(&format!("DROP TABLE IF EXISTS `{}`;\n\n", table_request.name));
     }
 
     // CREATE TABLE se solicitado
-    if table.structure {
-        let create_stmt = sqlx::query(&format!("SHOW CREATE TABLE `{}`", table.name))
+    if table_request.structure {
+        let create_stmt = sqlx::query(&format!("SHOW CREATE TABLE `{}`", table_request.name))
             .fetch_one(pool)
             .await
-            .map_err(|e| format!("Erro ao obter estrutura da tabela '{}': {}", table.name, e))?;
+            .map_err(|e| format!("Erro ao obter estrutura da tabela '{}': {}", table_request.name, e))?;
 
         let create_sql: String = create_stmt
             .try_get(1)
@@ -475,19 +510,19 @@ pub async fn dump_one_table_to_string(
     }
 
     // Dados se solicitado
-    if table.content {
+    if table_request.content {
         // Obter colunas e seus tipos
         let columns_query = format!(
             "SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS \
              WHERE TABLE_SCHEMA = '{}' AND TABLE_NAME = '{}' \
              ORDER BY ORDINAL_POSITION",
-            database, table.name
+            database, table_request.name
         );
 
         let column_rows = sqlx::query(&columns_query)
             .fetch_all(pool)
             .await
-            .map_err(|e| format!("Erro ao obter colunas da tabela '{}': {}", table.name, e))?;
+            .map_err(|e| format!("Erro ao obter colunas da tabela '{}': {}", table_request.name, e))?;
 
         if !column_rows.is_empty() {
             let columns: Vec<(String, String)> = column_rows
@@ -502,11 +537,11 @@ pub async fn dump_one_table_to_string(
                 .map_err(|e| format!("Erro ao ler info de colunas: {}", e))?;
 
             // Buscar todos os dados
-            let data_query = format!("SELECT * FROM `{}`", table.name);
+            let data_query = format!("SELECT * FROM `{}`", table_request.name);
             let data_rows = sqlx::query(&data_query)
                 .fetch_all(pool)
                 .await
-                .map_err(|e| format!("Erro ao obter dados da tabela '{}': {}", table.name, e))?;
+                .map_err(|e| format!("Erro ao obter dados da tabela '{}': {}", table_request.name, e))?;
 
             if !data_rows.is_empty() {
                 let batch_size = 100;
@@ -517,7 +552,7 @@ pub async fn dump_one_table_to_string(
                     .join(", ");
 
                 for chunk in data_rows.chunks(batch_size) {
-                    sql_output.push_str(&format!("INSERT INTO `{}` ({}) VALUES\n", table.name, column_list));
+                    sql_output.push_str(&format!("INSERT INTO `{}` ({}) VALUES\n", table_request.name, column_list));
 
                     for (i, row) in chunk.iter().enumerate() {
                         sql_output.push_str("(");
