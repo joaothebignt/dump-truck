@@ -1,0 +1,54 @@
+# Containerfile.linux - Build usando imagem base
+#
+# 1. Build da imagem base (apenas na primeira vez ou quando atualizar deps):
+#    podman build -f Containerfile.base -t dumper-base:latest .
+#
+# 2. Build do projeto (incremental, usa cache):
+#    podman build -f Containerfile.linux -t dumper-builder:latest .
+#    podman create --name dumper-extract dumper-builder:latest
+#    podman cp dumper-extract:/bundle/. ./src-tauri/target/release/bundle/
+#    podman cp dumper-extract:/dumper ./src-tauri/target/release/dumper
+#    podman rm dumper-extract
+#
+# ou usando just:
+#    just build-linux
+
+FROM dumper-base:latest AS node-deps
+
+ENV CARGO_INCREMENTAL=0
+
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --prefer-offline
+
+FROM node-deps AS rust-deps
+
+COPY src-tauri/Cargo.toml src-tauri/Cargo.lock ./src-tauri/
+COPY src-tauri/build.rs ./src-tauri/
+COPY src-tauri/tauri.conf.json ./src-tauri/
+COPY src-tauri/capabilities/ ./src-tauri/capabilities/
+COPY src-tauri/icons/ ./src-tauri/icons/
+RUN mkdir -p src-tauri/src && \
+    echo 'pub fn main() {}' > src-tauri/src/lib.rs && \
+    echo 'fn main() {}' > src-tauri/src/main.rs && \
+    cd src-tauri && cargo build --release --locked
+
+# Remover fingerprints do projeto para forçar recompilação apenas do código
+RUN rm -rf src-tauri/target/release/.fingerprint/dumper-* \
+           src-tauri/target/release/.fingerprint/dumper_lib-* \
+           src-tauri/target/release/deps/dumper* \
+           src-tauri/target/release/deps/libdumper* \
+           src-tauri/target/release/dumper*
+
+FROM rust-deps AS builder
+
+COPY src-tauri/src/ ./src-tauri/src/
+COPY index.html vite.config.js ./
+COPY public/ ./public/
+COPY src/ ./src/
+
+RUN npm run tauri build
+
+FROM scratch AS artifacts
+COPY --from=builder /app/src-tauri/target/release/bundle/ /bundle/
+COPY --from=builder /app/src-tauri/target/release/dumper /dumper
