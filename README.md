@@ -1,7 +1,39 @@
-# Tauri + Vue 3
+# <img src="src-tauri/icons/icon.png" alt="Dump Truck" width="48" align="absmiddle" /> Dump Truck
 
-This template should help get you started developing with Tauri + Vue 3 in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+App desktop para exportar, importar e copiar bancos MySQL/MariaDB com controle por tabela.
 
-## Recommended IDE Setup
+## O que faz
 
-- [VS Code](https://code.visualstudio.com/) + [Vue - Official](https://marketplace.visualstudio.com/items?itemName=Vue.volar) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+O Dump Truck conecta a servidores MySQL/MariaDB e facilita o trabalho com dumps:
+
+- **Conexões favoritas** — salve hosts e acompanhe se estão online
+- **Explorar bancos** — liste databases e tabelas com tamanho estimado
+- **Exportar (.sql)** — gere dumps com `mysqldump`, escolhendo quais tabelas incluir e se exporta estrutura, dados e/ou `DROP`
+- **Importar** — restaure um arquivo `.sql` em um database
+- **Copiar entre conexões** — transfira tabelas de um servidor/database para outro, com progresso
+
+Regras de exclusão (por sufixo, prefixo etc.) permitem pular tabelas ou partes do dump de forma consistente.
+
+## Requisitos
+
+- [Node.js](https://nodejs.org/) e npm
+- [Rust](https://www.rust-lang.org/) (para builds Tauri)
+- Cliente MySQL/MariaDB no `PATH` (`mysqldump` e `mysql`)
+
+## Desenvolvimento
+
+```bash
+npm install
+npm run tauri dev
+```
+
+## Build
+
+```bash
+npm run tauri build
+```
+
+## Stack
+
+- [Tauri 2](https://tauri.app/) + Rust
+- Vue 3 + Vite + Pinia
