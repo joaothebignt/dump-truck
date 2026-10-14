@@ -1,6 +1,6 @@
 <script setup>
 
-import { onMounted, reactive, ref } from "vue"
+import { computed, onMounted, reactive, ref } from "vue"
 import { useRoute, useRouter } from "vue-router"
 import { invoke } from "@tauri-apps/api/core"
 
@@ -13,11 +13,12 @@ const store = useConnectionsStore()
 const editingIndex = ref(null)
 const testing = ref(false)
 const testMessage = ref(null)
+const original = ref(null)
 
 const form = reactive({
 
   name: "",
-  host: "127.0.0.1", // pode ser IP ou hostname na rede local
+  host: "127.0.0.1", // IP, hostname ou domínio externo
   port: 3306,
   username: "",
   password: "",
@@ -26,6 +27,36 @@ const form = reactive({
 })
 
 const showPassword = ref(false)
+
+const isEditing = computed(() => editingIndex.value !== null)
+
+const hasChanges = computed(() => {
+  if (!isEditing.value || !original.value)
+    return false
+
+  const current = normalizeConnection(form)
+  const base = original.value
+
+  return (
+    current.name !== base.name ||
+    current.host !== base.host ||
+    current.port !== base.port ||
+    current.username !== base.username ||
+    current.password !== base.password ||
+    current.color !== base.color
+  )
+})
+
+function normalizeConnection(connection) {
+  return {
+    name: String(connection.name || "").trim(),
+    host: String(connection.host || "").trim(),
+    port: Number(connection.port) || 3306,
+    username: String(connection.username || ""),
+    password: String(connection.password || ""),
+    color: connection.color || "#3a7afe"
+  }
+}
 
 onMounted(() => {
 
@@ -38,12 +69,15 @@ onMounted(() => {
 
       editingIndex.value = idx
 
-      form.name = existing.name
-      form.host = existing.host
-      form.port = existing.port
-      form.username = existing.username
-      form.password = existing.password
-      form.color = existing.color || "#3a7afe"
+      const normalized = normalizeConnection(existing)
+      original.value = { ...normalized }
+
+      form.name = normalized.name
+      form.host = normalized.host
+      form.port = normalized.port
+      form.username = normalized.username
+      form.password = normalized.password
+      form.color = normalized.color
 
     }
   }
@@ -72,32 +106,17 @@ async function testConnection() {
   }
 }
 
-function save() {
+function saveChanges() {
+  if (!isEditing.value || !hasChanges.value)
+    return
 
-  if (editingIndex.value !== null) {
-
-    store.update(editingIndex.value, { ...form })
-
-  }
-
+  store.update(editingIndex.value, normalizeConnection(form))
   router.push("/")
-
 }
 
 function saveAndFavorite() {
-
-  if (editingIndex.value !== null) {
-
-    store.update(editingIndex.value, { ...form })
-
-  } else {
-
-    store.add({ ...form })
-
-  }
-
+  store.add(normalizeConnection(form))
   router.push("/")
-
 }
 
 </script>
@@ -133,7 +152,7 @@ function saveAndFavorite() {
             <input
               v-model="form.host"
               class="field-input host-input"
-              placeholder="Ex.: 192.168.0.10"
+              placeholder="Ex.: 192.168.0.10 ou db.exemplo.com"
             />
             <span class="host-port-separator">:</span>
             <input
@@ -198,24 +217,35 @@ function saveAndFavorite() {
           {{ testing ? "Testando…" : "Testar conexão" }}
         </button>
         <div class="actions-right">
-          <button
-            class="btn btn--primary"
-            @click="save"
-          >
-            Salvar
-          </button>
-          <button
-            class="btn btn--ghost"
-            @click="saveAndFavorite"
-          >
-            Salvar e favoritar
-          </button>
-          <button
-            class="btn btn--ghost"
-            @click="router.push('/')"
-          >
-            Cancelar
-          </button>
+          <template v-if="isEditing">
+            <button
+              class="btn btn--primary"
+              @click="saveChanges"
+              :disabled="!hasChanges"
+            >
+              Salvar alterações
+            </button>
+            <button
+              class="btn btn--ghost"
+              @click="router.push('/')"
+            >
+              Cancelar
+            </button>
+          </template>
+          <template v-else>
+            <button
+              class="btn btn--primary"
+              @click="saveAndFavorite"
+            >
+              Salvar e favoritar
+            </button>
+            <button
+              class="btn btn--ghost"
+              @click="router.push('/')"
+            >
+              Cancelar
+            </button>
+          </template>
         </div>
       </div>
     </div>
@@ -228,6 +258,7 @@ function saveAndFavorite() {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  padding-bottom: 20px;
 }
 
 .new-connection-header {

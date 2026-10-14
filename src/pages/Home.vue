@@ -1,6 +1,6 @@
 <script setup>
 
-import { onMounted, ref } from "vue"
+import { onMounted, onUnmounted, ref, watch } from "vue"
 import { useRouter } from "vue-router"
 import { invoke } from "@tauri-apps/api/core"
 
@@ -11,6 +11,10 @@ const router = useRouter()
 const store = useConnectionsStore()
 const dbStore = useDatabaseStore()
 const connectionStatus = ref({})
+const STATUS_POLL_MS = 4000
+
+let statusTimer = null
+let statusCheckInFlight = false
 
 function connectionKey(c) {
   return `${c.host || ""}:${c.port ?? 3306}`
@@ -34,34 +38,75 @@ function isOffline(c) {
 }
 
 async function refreshConnectionStatus() {
-  const next = { ...connectionStatus.value }
+  if (statusCheckInFlight)
+    return
+
   const list = store.favorites || []
-  const results = await Promise.allSettled(
-    list.map(async (c) => {
-      const key = connectionKey(c)
-      try {
-        const ok = await invoke("check_connection", {
-          host: String(c.host || ""),
-          port: Number(c.port) || 3306
-        })
-        return { key, ok }
-      } catch {
-        return { key, ok: false }
+  if (!list.length) {
+    connectionStatus.value = {}
+    return
+  }
+
+  statusCheckInFlight = true
+
+  try {
+    const results = await Promise.allSettled(
+      list.map(async (c) => {
+        const key = connectionKey(c)
+        try {
+          const ok = await invoke("check_connection", {
+            host: String(c.host || ""),
+            port: Number(c.port) || 3306
+          })
+          return { key, ok: !!ok }
+        } catch {
+          return { key, ok: false }
+        }
+      })
+    )
+
+    const next = {}
+    results.forEach((r) => {
+      if (r.status === "fulfilled" && r.value) {
+        next[r.value.key] = r.value.ok
       }
     })
-  )
-  results.forEach((r) => {
-    if (r.status === "fulfilled" && r.value) {
-      next[r.value.key] = r.value.ok
-    }
-  })
-  connectionStatus.value = next
+    connectionStatus.value = next
+  } finally {
+    statusCheckInFlight = false
+  }
+}
+
+function startStatusPolling() {
+  stopStatusPolling()
+  refreshConnectionStatus()
+  statusTimer = setInterval(() => {
+    refreshConnectionStatus()
+  }, STATUS_POLL_MS)
+}
+
+function stopStatusPolling() {
+  if (statusTimer) {
+    clearInterval(statusTimer)
+    statusTimer = null
+  }
 }
 
 onMounted(() => {
   store.load()
-  refreshConnectionStatus()
+  startStatusPolling()
 })
+
+onUnmounted(() => {
+  stopStatusPolling()
+})
+
+watch(
+  () => store.favorites.length,
+  () => {
+    refreshConnectionStatus()
+  }
+)
 
 function newConnection() {
 
@@ -202,6 +247,8 @@ async function connect(connection) {
   display: flex;
   flex-direction: column;
   height: 100%;
+  min-height: 0;
+  overflow: hidden;
 }
 
 .home-header {
@@ -263,17 +310,20 @@ async function connect(connection) {
 
 .connections-grid {
   flex: 1;
+  min-height: 0;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  grid-auto-rows: minmax(0, 1fr);
-  gap: 16px;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 20px;
   align-content: flex-start;
+  overflow-y: auto;
+  padding-bottom: 20px;
 }
 
 .connection-card {
   position: relative;
-  border-radius: 18px;
-  padding: 14px 14px 12px;
+  aspect-ratio: 3 / 4;
+  border-radius: 20px;
+  padding: 18px 16px 16px;
   background:
     radial-gradient(
       circle at top left,
@@ -297,7 +347,6 @@ async function connect(connection) {
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  min-height: 140px;
   opacity: 1;
   transition: transform 0.12s ease, box-shadow 0.12s ease, opacity 0.12s ease,
     border-color 0.12s ease, background 0.12s ease;
@@ -318,7 +367,8 @@ async function connect(connection) {
   transform: translateY(-2px);
   box-shadow:
     0 24px 60px rgba(0, 0, 0, 0.85),
-    0 0 0 1px rgba(37, 99, 235, 0.8);
+    0 0 0 1px color-mix(in srgb, var(--accent, #3a7afe) 80%, transparent);
+  border-color: color-mix(in srgb, var(--accent, #3a7afe) 90%, #020617 10%);
 }
 
 .connection-card--offline {
@@ -364,16 +414,17 @@ async function connect(connection) {
 .connection-card-body {
   display: flex;
   flex-direction: column;
-  justify-content: space-between;
+  justify-content: flex-end;
   flex: 1;
-  padding-top: 14px;
+  padding-top: 12px;
 }
 
 .connection-name {
   display: block;
-  font-size: 24px;
+  font-size: 22px;
   font-weight: 600;
   color: #f9fafb;
+  word-break: break-all;
 }
 
 .connection-actions {
@@ -391,9 +442,9 @@ async function connect(connection) {
 }
 
 .connection-actions .btn--icon {
-  padding-inline: 10px;
-  padding-block: 6px;
-  font-size: 13px;
+  padding-inline: 8px;
+  padding-block: 4px;
+  font-size: 12px;
 }
 
 .connection-card .btn--ghost {
@@ -444,12 +495,17 @@ async function connect(connection) {
 .connection-meta-text {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+  min-width: 0;
 }
 
 .connection-ip {
-  font-size: 12px;
+  margin-top: 0;
+  font-size: 13px;
   color: #9ca3af;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .connection-connect {
@@ -467,12 +523,6 @@ async function connect(connection) {
 .btn--ghost {
   font-size: 12px;
   padding-block: 6px;
-}
-
-@media (max-width: 1024px) {
-  .connections-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 }
 
 @media (max-width: 720px) {

@@ -14,3 +14,17 @@ pub struct TableInfo {
     pub name: String,
     pub size: u64,
 }
+
+#[derive(Serialize)]
+pub struct DatabaseInfo {
+    pub name: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct DumpTableSelection {
+    pub name: String,
+    pub structure: bool,
+    pub content: bool,
+    pub drop: bool,
+}

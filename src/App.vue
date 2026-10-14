@@ -3,8 +3,13 @@ import { computed, onMounted, ref, watch } from "vue"
 import { RouterView, useRouter } from "vue-router"
 import { invoke } from "@tauri-apps/api/core"
 import { useDatabaseStore } from "./stores/database"
+import {
+  useExportDefaultsStore,
+  selectionFromExportDefaults
+} from "./stores/exportDefaults"
 
 const dbStore = useDatabaseStore()
+const exportDefaults = useExportDefaultsStore()
 const router = useRouter()
 
 const loading = ref(false)
@@ -12,12 +17,19 @@ const loading = ref(false)
 const hasConnection = computed(() => !!dbStore.connection)
 
 const connectionLabel = computed(() => {
-  debugger
   const conn = dbStore.connection || {}
-  if (conn.name && conn.host) {
-    return `${conn.name} – ${conn.host}`
+  if (conn.host) {
+    return conn.port ? `${conn.host}:${conn.port}` : conn.host
   }
-  return conn.name || conn.host || "Conectado"
+  if (typeof conn.url === "string" && conn.url) {
+    try {
+      const parsed = new URL(conn.url)
+      return parsed.port ? `${parsed.hostname}:${parsed.port}` : parsed.hostname
+    } catch {
+      return conn.url
+    }
+  }
+  return "Conectado"
 })
 
 async function loadDatabases(){
@@ -50,13 +62,16 @@ async function loadTables(){
       database: dbStore.selectedDatabase
     })
 
-    dbStore.tables = tables.map(t=>({
-      name: t.name,
-      size: t.size,
-      structure: true,
-      content: true,
-      drop: true
-    }))
+    dbStore.tables = tables.map(t => {
+      const sel = selectionFromExportDefaults(t.name, exportDefaults.rules)
+      return {
+        name: t.name,
+        size: t.size,
+        structure: sel.structure,
+        content: sel.content,
+        drop: sel.drop
+      }
+    })
   }catch(e){
     console.error(e)
   }
@@ -72,10 +87,8 @@ function refreshDatabases(){
   loadDatabases()
 }
 
-function closeConnection(){
+function goHome(){
   dbStore.clearConnection()
-  dbStore.selectedDatabase = null
-  dbStore.tables = []
   router.push("/")
 }
 
@@ -107,11 +120,24 @@ watch(
   <div class="layout">
     <header class="topbar">
       <div class="topbar-left">
-        <div class="logo">DB Dumper</div>
+        <div class="logo">Dump Truck</div>
       </div>
 
       <div class="topbar-center" v-if="hasConnection">
-        <div class="connection-tab">
+        <button
+          type="button"
+          class="btn btn--ghost btn--icon topbar-home"
+          title="Voltar para conexões"
+          :style="{ '--btn-accent': dbStore.connection?.color || '#3a7afe' }"
+          @click="goHome"
+        >
+          <i class="ri-home-line"></i>
+        </button>
+
+        <div
+          class="connection-tab"
+          :style="{ '--accent': dbStore.connection?.color || '#3a7afe' }"
+        >
           <div class="connection-main">
             <span class="connection-name">
               {{ dbStore.connection?.name || "Conexão ativa" }}
@@ -124,14 +150,15 @@ watch(
             <span class="connection-db-value">
               {{ dbStore.selectedDatabase || "Nenhum selecionado" }}
             </span>
-            <span
+            <button
               v-if="dbStore.selectedDatabase"
+              type="button"
               class="connection-db-clear"
               title="Fechar database atual"
               @click.stop="clearDatabase"
             >
               <i class="ri-close-line"></i>
-            </span>
+            </button>
           </div>
         </div>
       </div>
@@ -140,20 +167,13 @@ watch(
         <span
           v-if="hasConnection"
           class="topbar-status topbar-status--online"
+          :style="{ '--accent': dbStore.connection?.color || '#3a7afe' }"
         >
           {{ connectionLabel }}
         </span>
         <span v-else class="topbar-status">
           Nenhuma conexão ativa
         </span>
-        <button
-          v-if="hasConnection"
-          class="btn btn--ghost btn--icon topbar-close"
-          type="button"
-          @click="closeConnection"
-        >
-          <i class="ri-close-line"></i>
-        </button>
       </div>
     </header>
 
@@ -214,7 +234,9 @@ body,
   left: 50%;
   transform: translateX(-50%);
   display: flex;
+  align-items: center;
   justify-content: center;
+  gap: 8px;
 }
 
 .logo {
@@ -231,8 +253,8 @@ body,
   gap: 10px;
   padding: 6px 14px;
   border-radius: 999px;
-  background: rgba(15, 23, 42, 0.8);
-  box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.25);
+  background: color-mix(in srgb, var(--accent, #3a7afe) 14%, rgba(15, 23, 42, 0.92));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent, #3a7afe) 55%, transparent);
 }
 
 .connection-main {
@@ -268,9 +290,27 @@ body,
 }
 
 .connection-db-clear {
-  font-size: 12px;
-  padding-inline: 8px;
-  padding-block: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent, #3a7afe) 45%, #374151 55%);
+  background: color-mix(in srgb, var(--accent, #3a7afe) 12%, transparent);
+  color: #e5e7eb;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.connection-db-clear:hover {
+  background: color-mix(in srgb, var(--accent, #3a7afe) 22%, transparent);
+}
+
+.topbar-home {
+  flex-shrink: 0;
 }
 
 .field-select--pill {
@@ -319,14 +359,9 @@ body,
 }
 
 .topbar-status--online {
-  border-color: #3a7afe;
-  color: #e5edff;
-  background: rgba(58, 122, 254, 0.1);
-}
-
-.topbar-close {
-  font-size: 11px;
-  padding-inline: 12px;
+  border-color: color-mix(in srgb, var(--accent, #3a7afe) 75%, #27272a 25%);
+  color: color-mix(in srgb, var(--accent, #3a7afe) 35%, #e5e7eb 65%);
+  background: color-mix(in srgb, var(--accent, #3a7afe) 16%, transparent);
 }
 
 .icon {
@@ -345,7 +380,7 @@ body,
   display: flex;
   flex-direction: column;
   min-height: 0;
-  padding: 20px 24px 24px;
+  padding: 20px 24px 0;
 }
 
 .content-inner {
