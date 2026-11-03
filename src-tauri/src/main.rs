@@ -7,6 +7,7 @@ use sqlx::MySqlPool;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
@@ -112,10 +113,64 @@ fn build_mysql_url(user: &str, pass: &str, host: &str, port: u16) -> String {
     )
 }
 
+/// Apps GUI no macOS costumam herdar um PATH mínimo e não veem o Homebrew.
+fn find_cli_binary(name: &str) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    const FALLBACK_DIRS: &[&str] = &[
+        "/opt/homebrew/bin",
+        "/opt/homebrew/opt/mysql-client/bin",
+        "/opt/homebrew/opt/mariadb/bin",
+        "/usr/local/bin",
+        "/usr/local/opt/mysql-client/bin",
+        "/usr/local/mysql/bin",
+        "/usr/bin",
+    ];
+
+    for dir in FALLBACK_DIRS {
+        let candidate = Path::new(dir).join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+fn cli_not_found_msg(bin: &str) -> String {
+    format!(
+        "{bin} não encontrado. Instale o cliente MySQL/MariaDB (ex.: brew install mysql-client) e reinicie o app."
+    )
+}
+
+fn mysqldump_bin() -> Result<&'static Path, String> {
+    static BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
+    BIN.get_or_init(|| find_cli_binary("mysqldump"))
+        .as_deref()
+        .ok_or_else(|| cli_not_found_msg("mysqldump"))
+}
+
+fn mysql_bin() -> Result<&'static Path, String> {
+    static BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
+    BIN.get_or_init(|| find_cli_binary("mysql"))
+        .as_deref()
+        .ok_or_else(|| cli_not_found_msg("mysql"))
+}
+
 fn mysqldump_help_text() -> &'static str {
     static HELP: OnceLock<String> = OnceLock::new();
     HELP.get_or_init(|| {
-        Command::new("mysqldump")
+        let Ok(bin) = mysqldump_bin() else {
+            return String::new();
+        };
+        Command::new(bin)
             .arg("--help")
             .output()
             .map(|o| {
@@ -260,7 +315,7 @@ fn run_mysqldump_to_file(
         file.write_all(b"\n\n").map_err(|e| e.to_string())?;
     }
 
-    let mut cmd = Command::new("mysqldump");
+    let mut cmd = Command::new(mysqldump_bin()?);
     cmd.arg("-h")
         .arg(host)
         .arg("-P")
@@ -293,8 +348,7 @@ fn run_mysqldump_to_file(
 
     let mut child = cmd.spawn().map_err(|e: std::io::Error| {
         if e.kind() == ErrorKind::NotFound {
-            return "mysqldump não encontrado no PATH. Instale o cliente MySQL/mariadb e garanta que o binário 'mysqldump' esteja disponível."
-                .to_string();
+            return cli_not_found_msg("mysqldump");
         }
         e.to_string()
     })?;
@@ -537,6 +591,26 @@ async fn tables_with_size(
 }
 
 #[tauri::command]
+async fn table_preview(
+    conn: String,
+    database: String,
+    table: String,
+) -> Result<models::TablePreview, String> {
+    let pool = create_pool(&conn).await.map_err(|e| e.to_string())?;
+    preview_table(&pool, &database, &table).await
+}
+
+#[tauri::command]
+async fn table_structure(
+    conn: String,
+    database: String,
+    table: String,
+) -> Result<models::TableStructure, String> {
+    let pool = create_pool(&conn).await.map_err(|e| e.to_string())?;
+    db::table_structure(&pool, &database, &table).await
+}
+
+#[tauri::command]
 async fn dump_tables(
     conn: String,
     database: String,
@@ -547,12 +621,13 @@ async fn dump_tables(
     }
 
     let (host, port, user, pass) = parse_mysql_conn(&conn)?;
+    let dump_bin = mysqldump_bin()?;
 
     let db_name = database.clone();
     let selected_tables = tables.clone();
 
     let output = tauri::async_runtime::spawn_blocking(move || {
-        let mut cmd = Command::new("mysqldump");
+        let mut cmd = Command::new(dump_bin);
 
         cmd.arg("-h")
             .arg(host)
@@ -576,8 +651,7 @@ async fn dump_tables(
     .map_err(|e| e.to_string())?
     .map_err(|e: std::io::Error| {
         if e.kind() == ErrorKind::NotFound {
-            return "mysqldump não encontrado no PATH. Instale o cliente MySQL/mariadb e garanta que o binário 'mysqldump' esteja disponível."
-                .to_string();
+            return cli_not_found_msg("mysqldump");
         }
         e.to_string()
     })?;
@@ -614,11 +688,12 @@ async fn dump_single_table(
     }
 
     let (host, port, user, pass) = parse_mysql_conn(&conn)?;
+    let dump_bin = mysqldump_bin()?;
     let db_name = database.clone();
     let table_name = table.clone();
 
     let output = tauri::async_runtime::spawn_blocking(move || {
-        let mut cmd = Command::new("mysqldump");
+        let mut cmd = Command::new(dump_bin);
 
         cmd.arg("-h")
             .arg(host)
@@ -649,8 +724,7 @@ async fn dump_single_table(
 
         let mut child = cmd.spawn().map_err(|e: std::io::Error| {
             if e.kind() == ErrorKind::NotFound {
-                return "mysqldump não encontrado no PATH. Instale o cliente MySQL/mariadb e garanta que o binário 'mysqldump' esteja disponível."
-                    .to_string();
+                return cli_not_found_msg("mysqldump");
             }
             e.to_string()
         })?;
@@ -749,7 +823,7 @@ fn run_mysql_import_file(
 
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
 
-    let mut cmd = Command::new("mysql");
+    let mut cmd = Command::new(mysql_bin()?);
     cmd.arg("-h")
         .arg(host)
         .arg("-P")
@@ -764,8 +838,7 @@ fn run_mysql_import_file(
 
     let mut child = cmd.spawn().map_err(|e: std::io::Error| {
         if e.kind() == ErrorKind::NotFound {
-            return "mysql não encontrado no PATH. Instale o cliente MySQL/mariadb."
-                .to_string();
+            return cli_not_found_msg("mysql");
         }
         e.to_string()
     })?;
@@ -1038,6 +1111,8 @@ fn main() {
             check_connection,
             databases,
             tables_with_size,
+            table_preview,
+            table_structure,
             dump_tables,
             dump_single_table,
             dump_export,

@@ -1,6 +1,6 @@
 <script setup>
 
-import { ref, computed, onMounted, watch } from "vue"
+import { ref, computed, onMounted, onUnmounted, watch } from "vue"
 import { invoke } from "@tauri-apps/api/core"
 import { open } from "@tauri-apps/plugin-dialog"
 
@@ -27,6 +27,17 @@ const importPending = ref(false)
 const importCancelled = ref(false)
 const importPath = ref("")
 const importFileName = ref("")
+
+const previewOpen = ref(false)
+const previewTable = ref("")
+const previewTab = ref("content")
+const previewLoading = ref(false)
+const previewError = ref("")
+const structureError = ref("")
+const preview = ref(null)
+const structure = ref(null)
+const createCopied = ref(false)
+let previewRequest = 0
 
 const tablesLocked = computed(() =>
   exporting.value || importing.value || copying.value
@@ -269,6 +280,81 @@ function onCopyingChange(value){
   copying.value = value
 }
 
+function closePreview(){
+  previewOpen.value = false
+  previewTable.value = ""
+  preview.value = null
+  structure.value = null
+  previewError.value = ""
+  structureError.value = ""
+  previewLoading.value = false
+  createCopied.value = false
+}
+
+async function openTablePreview(name){
+
+  if (tablesLocked.value || !store.connection || !store.selectedDatabase)
+    return
+
+  const request = ++previewRequest
+  previewTable.value = name
+  previewOpen.value = true
+  previewTab.value = "content"
+  previewLoading.value = true
+  previewError.value = ""
+  structureError.value = ""
+  preview.value = null
+  structure.value = null
+  createCopied.value = false
+
+  const conn = store.connection.url || store.connection
+  const database = store.selectedDatabase
+
+  const [previewResult, structureResult] = await Promise.allSettled([
+    invoke("table_preview", { conn, database, table: name }),
+    invoke("table_structure", { conn, database, table: name })
+  ])
+
+  if (request !== previewRequest)
+    return
+
+  if (previewResult.status === "fulfilled")
+    preview.value = previewResult.value
+  else
+    previewError.value = String(previewResult.reason || "Erro ao carregar a prévia.")
+
+  if (structureResult.status === "fulfilled")
+    structure.value = structureResult.value
+  else
+    structureError.value = String(structureResult.reason || "Erro ao carregar a estrutura.")
+
+  previewLoading.value = false
+
+}
+
+async function copyCreateSql(){
+
+  const sql = structure.value?.createSql
+  if (!sql)
+    return
+
+  try {
+    await navigator.clipboard.writeText(sql)
+    createCopied.value = true
+    setTimeout(() => {
+      createCopied.value = false
+    }, 1500)
+  } catch (e) {
+    console.error(e)
+  }
+
+}
+
+function onPreviewKeydown(event){
+  if (event.key === "Escape" && previewOpen.value)
+    closePreview()
+}
+
 function onCopyDone(payload){
   const sameHost =
     String(payload?.targetHost || "") === String(store.connection?.host || "") &&
@@ -332,7 +418,12 @@ function formatSize(bytes){
 onMounted(()=>{
 
   loadDatabases()
+  window.addEventListener("keydown", onPreviewKeydown)
 
+})
+
+onUnmounted(()=>{
+  window.removeEventListener("keydown", onPreviewKeydown)
 })
 
 watch(
@@ -344,6 +435,7 @@ watch(
     dbFilter.value = ""
     dbSort.value = "name-asc"
     filter.value = ""
+    closePreview()
     exporting.value = false
     importing.value = false
     copying.value = false
@@ -358,6 +450,7 @@ watch(
     exporting.value = false
     importing.value = false
     copying.value = false
+    closePreview()
     clearImportSelection()
   }
 )
@@ -655,24 +748,28 @@ watch(
                   <tr
                     v-for="t in filteredTables"
                     :key="t.name"
+                    class="table-row"
+                    :class="{ 'table-row--open': previewOpen && previewTable === t.name }"
+                    title="Ver prévia e estrutura"
+                    @click="openTablePreview(t.name)"
                   >
-                    <td>{{ t.name }}</td>
+                    <td class="table-name">{{ t.name }}</td>
                     <td>{{ formatSize(t.size) }}</td>
-                    <td class="col-action">
+                    <td class="col-action" @click.stop>
                       <input
                         type="checkbox"
                         v-model="t.structure"
                         :disabled="tablesLocked"
                       >
                     </td>
-                    <td class="col-action">
+                    <td class="col-action" @click.stop>
                       <input
                         type="checkbox"
                         v-model="t.content"
                         :disabled="tablesLocked"
                       >
                     </td>
-                    <td class="col-action">
+                    <td class="col-action" @click.stop>
                       <input
                         type="checkbox"
                         v-model="t.drop"
@@ -713,6 +810,173 @@ watch(
         />
       </div>
     </div>
+
+    <Teleport to="body">
+      <div
+        v-if="previewOpen"
+        class="preview-backdrop"
+        @click.self="closePreview"
+      >
+        <div
+          class="preview-panel"
+          role="dialog"
+          aria-modal="true"
+          :aria-label="previewTable"
+          :style="{ '--accent': store.connection?.color || '#3a7afe' }"
+        >
+          <header class="preview-header">
+            <div class="preview-heading">
+              <p class="preview-database">{{ store.selectedDatabase }}</p>
+              <h2 class="preview-title">{{ previewTable }}</h2>
+            </div>
+            <button
+              type="button"
+              class="preview-close"
+              title="Fechar"
+              @click="closePreview"
+            >
+              <i class="ri-close-line"></i>
+            </button>
+          </header>
+
+          <div class="preview-tabs">
+            <button
+              type="button"
+              class="preview-tab"
+              :class="{ 'preview-tab--active': previewTab === 'content' }"
+              @click="previewTab = 'content'"
+            >
+              Conteúdo
+            </button>
+            <button
+              type="button"
+              class="preview-tab"
+              :class="{ 'preview-tab--active': previewTab === 'structure' }"
+              @click="previewTab = 'structure'"
+            >
+              Estrutura
+            </button>
+          </div>
+
+          <div class="preview-body">
+            <div
+              v-if="previewLoading"
+              class="preview-status"
+            >
+              Carregando...
+            </div>
+
+            <template v-else-if="previewTab === 'content'">
+              <p
+                v-if="previewError"
+                class="preview-error"
+              >
+                {{ previewError }}
+              </p>
+              <p
+                v-else-if="preview && !preview.rows.length"
+                class="preview-status"
+              >
+                A tabela não tem linhas.
+              </p>
+              <template v-else-if="preview">
+                <p class="preview-meta">
+                  {{ preview.rows.length }}
+                  {{ preview.rows.length === 1 ? "linha" : "linhas" }}
+                  · ORDER BY id DESC
+                  <template v-if="preview.rows.length >= preview.limit">
+                    · mostrando as {{ preview.limit }} mais recentes
+                  </template>
+                </p>
+                <div class="preview-scroll">
+                  <table class="preview-table">
+                    <thead>
+                      <tr>
+                        <th
+                          v-for="column in preview.columns"
+                          :key="column"
+                        >
+                          {{ column }}
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr
+                        v-for="(row, rowIndex) in preview.rows"
+                        :key="rowIndex"
+                      >
+                        <td
+                          v-for="(cell, cellIndex) in row"
+                          :key="preview.columns[cellIndex] + '-' + cellIndex"
+                          :title="cell == null ? 'NULL' : cell"
+                          :class="{ 'preview-null': cell == null }"
+                        >
+                          {{ cell == null ? "NULL" : cell }}
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </template>
+            </template>
+
+            <template v-else>
+              <p
+                v-if="structureError"
+                class="preview-error"
+              >
+                {{ structureError }}
+              </p>
+              <template v-else-if="structure">
+                <div class="preview-scroll preview-scroll--structure">
+                  <table class="preview-table">
+                    <thead>
+                      <tr>
+                        <th>Campo</th>
+                        <th>Tipo</th>
+                        <th>Nulo</th>
+                        <th>Chave</th>
+                        <th>Padrão</th>
+                        <th>Extra</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr
+                        v-for="column in structure.columns"
+                        :key="column.name"
+                      >
+                        <td>{{ column.name }}</td>
+                        <td>{{ column.columnType }}</td>
+                        <td>{{ column.nullable ? "Sim" : "Não" }}</td>
+                        <td>{{ column.key || "—" }}</td>
+                        <td :class="{ 'preview-null': column.default == null }">
+                          {{ column.default == null ? "NULL" : column.default }}
+                        </td>
+                        <td>{{ column.extra || "—" }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+
+                  <div class="preview-create">
+                    <div class="preview-create-bar">
+                      <span>CREATE</span>
+                      <button
+                        type="button"
+                        class="preview-copy"
+                        @click="copyCreateSql"
+                      >
+                        {{ createCopied ? "Copiado" : "Copiar" }}
+                      </button>
+                    </div>
+                    <pre class="preview-sql">{{ structure.createSql }}</pre>
+                  </div>
+                </div>
+              </template>
+            </template>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 
 </template>
@@ -1434,6 +1698,232 @@ watch(
   width:60px;
   text-align:center;
   white-space:nowrap;
+}
+
+.table-row{
+  cursor:pointer;
+}
+
+.table-name{
+  color:#f9fafb;
+}
+
+.table-row:hover .table-name,
+.table-row--open .table-name{
+  color: color-mix(in srgb, var(--accent, #3a7afe) 45%, #f9fafb 55%);
+}
+
+.table-row--open td{
+  background: color-mix(in srgb, var(--accent, #3a7afe) 12%, transparent);
+}
+
+.preview-backdrop{
+  position:fixed;
+  inset:0;
+  z-index:50;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:28px;
+  background:rgba(0, 0, 0, 0.72);
+}
+
+.preview-panel{
+  width:min(1120px, 100%);
+  height:min(760px, 100%);
+  display:flex;
+  flex-direction:column;
+  min-height:0;
+  border-radius:18px;
+  border:1px solid color-mix(in srgb, var(--accent, #3a7afe) 45%, #27272a 55%);
+  background:
+    radial-gradient(
+      circle at top left,
+      color-mix(in srgb, var(--accent, #3a7afe) 16%, transparent),
+      transparent 42%
+    ),
+    #020617;
+  box-shadow:0 24px 80px rgba(0, 0, 0, 0.55);
+  overflow:hidden;
+}
+
+.preview-header{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:16px;
+  padding:18px 18px 12px;
+}
+
+.preview-heading{
+  min-width:0;
+}
+
+.preview-database{
+  margin:0 0 4px;
+  font-size:11px;
+  letter-spacing:0.12em;
+  text-transform:uppercase;
+  color:#9ca3af;
+}
+
+.preview-title{
+  margin:0;
+  font-size:18px;
+  font-weight:600;
+  color:#f9fafb;
+  word-break:break-all;
+}
+
+.preview-close{
+  width:32px;
+  height:32px;
+  border:none;
+  border-radius:999px;
+  background:rgba(39, 39, 42, 0.9);
+  color:#e5e7eb;
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  cursor:pointer;
+  flex-shrink:0;
+}
+
+.preview-close:hover{
+  background: color-mix(in srgb, var(--accent, #3a7afe) 28%, #27272a 72%);
+}
+
+.preview-tabs{
+  display:flex;
+  gap:8px;
+  padding:0 18px 12px;
+}
+
+.preview-tab{
+  height:32px;
+  padding:0 14px;
+  border-radius:999px;
+  border:1px solid #27272a;
+  background:transparent;
+  color:#9ca3af;
+  font-size:13px;
+  cursor:pointer;
+}
+
+.preview-tab--active{
+  border-color: color-mix(in srgb, var(--accent, #3a7afe) 70%, #27272a 30%);
+  background: color-mix(in srgb, var(--accent, #3a7afe) 18%, transparent);
+  color:#f9fafb;
+}
+
+.preview-body{
+  flex:1;
+  min-height:0;
+  display:flex;
+  flex-direction:column;
+  padding:0 18px 18px;
+}
+
+.preview-meta,
+.preview-status,
+.preview-error{
+  margin:0 0 10px;
+  font-size:12px;
+  color:#9ca3af;
+}
+
+.preview-error{
+  color:#fca5a5;
+}
+
+.preview-scroll{
+  flex:1;
+  min-height:0;
+  overflow:auto;
+  border-radius:12px;
+  border:1px solid color-mix(in srgb, var(--accent, #3a7afe) 22%, #1f2937 78%);
+}
+
+.preview-scroll--structure{
+  display:flex;
+  flex-direction:column;
+}
+
+.preview-table{
+  width:max-content;
+  min-width:100%;
+  border-collapse:collapse;
+  background:transparent;
+}
+
+.preview-table th,
+.preview-table td{
+  max-width:280px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  border-bottom:1px solid #111827;
+  padding:8px 10px;
+  font-size:12px;
+  text-align:left;
+}
+
+.preview-table thead{
+  position:sticky;
+  top:0;
+  z-index:1;
+  background:#0f172a;
+}
+
+.preview-table th{
+  color:#9ca3af;
+  font-weight:500;
+}
+
+.preview-null{
+  color:#6b7280;
+  font-style:italic;
+}
+
+.preview-create{
+  border-top:1px solid #1f2937;
+  background:rgba(2, 6, 23, 0.65);
+}
+
+.preview-create-bar{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:10px 12px 0;
+  font-size:11px;
+  letter-spacing:0.12em;
+  text-transform:uppercase;
+  color:#9ca3af;
+}
+
+.preview-copy{
+  height:26px;
+  padding:0 10px;
+  border-radius:999px;
+  border:1px solid color-mix(in srgb, var(--accent, #3a7afe) 45%, #27272a 55%);
+  background:transparent;
+  color:#e5e7eb;
+  font-size:12px;
+  letter-spacing:0;
+  text-transform:none;
+  cursor:pointer;
+}
+
+.preview-sql{
+  margin:8px 0 0;
+  padding:0 12px 12px;
+  max-height:220px;
+  overflow:auto;
+  white-space:pre;
+  font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size:12px;
+  line-height:1.5;
+  color:#e5e7eb;
 }
 
 </style>
