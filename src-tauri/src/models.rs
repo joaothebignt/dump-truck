@@ -18,6 +18,9 @@ pub struct DumpTableSelection {
     pub structure: bool,
     pub content: bool,
     pub drop: bool,
+    /// Tamanho estimado (bytes) para balancear chunks paralelos.
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 #[derive(Serialize)]

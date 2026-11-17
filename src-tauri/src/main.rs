@@ -4,14 +4,17 @@ mod models;
 use serde::Serialize;
 use sqlx::mysql::MySqlConnectOptions;
 use sqlx::MySqlPool;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter};
+
+/// Máximo de processos mysqldump em paralelo (hosts externos / shared hosting).
+const MAX_PARALLEL_DUMPS: usize = 4;
 
 use db::*;
 use models::DumpTableSelection;
@@ -211,6 +214,11 @@ fn apply_mysqldump_safe_flags(cmd: &mut Command) {
     if mysqldump_supports("column-statistics") {
         cmd.arg("--column-statistics=0");
     }
+
+    // Compressão de protocolo reduz bytes na WAN (hosts externos).
+    if mysqldump_supports("compress") {
+        cmd.arg("--compress");
+    }
 }
 
 fn parse_mysqldump_verbose_table(line: &str) -> Option<String> {
@@ -293,7 +301,7 @@ fn run_mysqldump_to_file(
     output_path: &str,
     append: bool,
     progress_total: usize,
-    progress_offset: usize,
+    progress_counter: &Arc<AtomicUsize>,
 ) -> Result<(), String> {
     if tables.is_empty() || (!structure && !content) {
         return Ok(());
@@ -354,7 +362,7 @@ fn run_mysqldump_to_file(
     })?;
 
     let pid = child.id();
-    DUMP_PID.store(pid, Ordering::SeqCst);
+    register_dump_pid(pid);
 
     if DUMP_CANCELLED.load(Ordering::SeqCst) {
         let _ = child.kill();
@@ -365,7 +373,7 @@ fn run_mysqldump_to_file(
 
     let stderr_pipe = child.stderr.take();
     let app_progress = app.clone();
-    let tables_index: Vec<String> = tables.to_vec();
+    let progress_counter = Arc::clone(progress_counter);
     let total = progress_total.max(1);
 
     let stderr_thread = std::thread::spawn(move || {
@@ -387,17 +395,15 @@ fn run_mysqldump_to_file(
                 }
                 last_table = table.clone();
 
-                let index = tables_index
-                    .iter()
-                    .position(|t| t == &table)
-                    .map(|i| progress_offset + i + 1)
-                    .unwrap_or(progress_offset.saturating_add(1));
+                // Contador monotônico: com dump paralelo o índice alfabético
+                // saltava (ex.: 3% → 80% → 20%). Aqui só avança.
+                let index = (progress_counter.fetch_add(1, Ordering::SeqCst) + 1).min(total);
 
                 let _ = app_progress.emit(
                     "dump-progress",
                     DumpProgressPayload {
                         table,
-                        index: index.min(total),
+                        index,
                         total,
                     },
                 );
@@ -428,8 +434,33 @@ fn run_mysqldump_to_file(
     Ok(())
 }
 
-static DUMP_PID: AtomicU32 = AtomicU32::new(0);
 static DUMP_CANCELLED: AtomicBool = AtomicBool::new(false);
+static DUMP_PIDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+
+fn dump_pids() -> &'static Mutex<HashSet<u32>> {
+    DUMP_PIDS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn register_dump_pid(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    if let Ok(mut set) = dump_pids().lock() {
+        set.insert(pid);
+    }
+}
+
+fn clear_dump_pid(pid: u32) {
+    if let Ok(mut set) = dump_pids().lock() {
+        set.remove(&pid);
+    }
+}
+
+fn clear_all_dump_pids() {
+    if let Ok(mut set) = dump_pids().lock() {
+        set.clear();
+    }
+}
 
 fn kill_pid(pid: u32) -> Result<(), String> {
     #[cfg(unix)]
@@ -451,23 +482,24 @@ fn kill_pid(pid: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn clear_dump_pid(pid: u32) {
-    let _ = DUMP_PID.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
-}
-
 #[tauri::command]
 fn prepare_dump() {
     DUMP_CANCELLED.store(false, Ordering::SeqCst);
-    DUMP_PID.store(0, Ordering::SeqCst);
+    clear_all_dump_pids();
 }
 
 #[tauri::command]
 fn cancel_dump() -> Result<(), String> {
     DUMP_CANCELLED.store(true, Ordering::SeqCst);
 
-    let pid = DUMP_PID.swap(0, Ordering::SeqCst);
-    if pid != 0 {
-        kill_pid(pid)?;
+    let pids: Vec<u32> = dump_pids()
+        .lock()
+        .map(|set| set.iter().copied().collect())
+        .unwrap_or_default();
+    clear_all_dump_pids();
+
+    for pid in pids {
+        let _ = kill_pid(pid);
     }
 
     Ok(())
@@ -730,7 +762,7 @@ async fn dump_single_table(
         })?;
 
         let pid = child.id();
-        DUMP_PID.store(pid, Ordering::SeqCst);
+        register_dump_pid(pid);
 
         if DUMP_CANCELLED.load(Ordering::SeqCst) {
             let _ = child.kill();
@@ -844,7 +876,7 @@ fn run_mysql_import_file(
     })?;
 
     let pid = child.id();
-    DUMP_PID.store(pid, Ordering::SeqCst);
+    register_dump_pid(pid);
 
     if DUMP_CANCELLED.load(Ordering::SeqCst) {
         let _ = child.kill();
@@ -867,6 +899,77 @@ fn run_mysql_import_file(
     Ok(())
 }
 
+/// Particiona tabelas em até `max_chunks` chunks balanceados por tamanho.
+fn partition_tables_for_parallel(
+    tables: &[(String, u64)],
+    max_chunks: usize,
+) -> Vec<Vec<String>> {
+    if tables.is_empty() {
+        return Vec::new();
+    }
+
+    let n_chunks = max_chunks.min(tables.len()).max(1);
+    if n_chunks == 1 {
+        return vec![tables.iter().map(|(name, _)| name.clone()).collect()];
+    }
+
+    let has_size = tables.iter().any(|(_, size)| *size > 0);
+
+    if has_size {
+        let mut sorted: Vec<(String, u64)> = tables.to_vec();
+        sorted.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+        });
+
+        let mut chunks: Vec<(u64, Vec<String>)> =
+            (0..n_chunks).map(|_| (0u64, Vec::new())).collect();
+
+        for (name, size) in sorted {
+            let idx = chunks
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (sum, _))| *sum)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            chunks[idx].0 = chunks[idx].0.saturating_add(size);
+            chunks[idx].1.push(name);
+        }
+
+        chunks
+            .into_iter()
+            .filter(|(_, names)| !names.is_empty())
+            .map(|(_, names)| names)
+            .collect()
+    } else {
+        let mut chunks: Vec<Vec<String>> = vec![Vec::new(); n_chunks];
+        for (i, (name, _)) in tables.iter().enumerate() {
+            chunks[i % n_chunks].push(name.clone());
+        }
+        chunks.into_iter().filter(|c| !c.is_empty()).collect()
+    }
+}
+
+fn append_file_to_output(
+    output_path: &str,
+    part_path: &Path,
+    prepend_separator: bool,
+) -> Result<(), String> {
+    let mut out = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output_path)
+        .map_err(|e| e.to_string())?;
+
+    if prepend_separator {
+        out.write_all(b"\n\n").map_err(|e| e.to_string())?;
+    }
+
+    let mut input = std::fs::File::open(part_path).map_err(|e| e.to_string())?;
+    std::io::copy(&mut input, &mut out).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn dump_table_groups_to_file(
     app: &AppHandle,
     host: &str,
@@ -877,58 +980,180 @@ fn dump_table_groups_to_file(
     selected: &[DumpTableSelection],
     output_path: &str,
 ) -> Result<(), String> {
-    let mut groups: BTreeMap<(bool, bool, bool), Vec<String>> = BTreeMap::new();
+    let mut groups: BTreeMap<(bool, bool, bool), Vec<(String, u64)>> = BTreeMap::new();
 
     for table in selected {
         groups
             .entry((table.structure, table.content, table.drop))
             .or_default()
-            .push(table.name.clone());
+            .push((table.name.clone(), table.size.unwrap_or(0)));
     }
 
     for names in groups.values_mut() {
-        names.sort_by_key(|name| name.to_lowercase());
+        names.sort_by_key(|(name, _)| name.to_lowercase());
     }
 
     let total = selected.len().max(1);
-    let mut first = true;
-    let mut offset = 0usize;
+    let progress_counter = Arc::new(AtomicUsize::new(0));
+    let mut first_write = true;
 
-    for ((structure, content, drop), names) in groups {
+    for ((structure, content, drop), tables_with_size) in groups {
         if DUMP_CANCELLED.load(Ordering::SeqCst) {
             return Err("CANCELLED".to_string());
         }
 
+        let names: Vec<String> = tables_with_size
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+
         if let Some(first_table) = names.first() {
+            let started = progress_counter.load(Ordering::SeqCst);
             let _ = app.emit(
                 "dump-progress",
                 DumpProgressPayload {
                     table: first_table.clone(),
-                    index: (offset + 1).min(total),
+                    index: (started + 1).min(total),
                     total,
                 },
             );
         }
 
-        run_mysqldump_to_file(
-            app,
-            host,
-            port,
-            user,
-            pass,
-            database,
-            &names,
-            structure,
-            content,
-            drop,
-            output_path,
-            !first,
-            total,
-            offset,
-        )?;
+        // Structure-only ou poucas tabelas: um único processo (menos handshakes).
+        let use_parallel = content && names.len() >= 2;
 
-        offset += names.len();
-        first = false;
+        if !use_parallel {
+            run_mysqldump_to_file(
+                app,
+                host,
+                port,
+                user,
+                pass,
+                database,
+                &names,
+                structure,
+                content,
+                drop,
+                output_path,
+                !first_write,
+                total,
+                &progress_counter,
+            )?;
+            first_write = false;
+            continue;
+        }
+
+        let chunks = partition_tables_for_parallel(&tables_with_size, MAX_PARALLEL_DUMPS);
+
+        if chunks.len() <= 1 {
+            run_mysqldump_to_file(
+                app,
+                host,
+                port,
+                user,
+                pass,
+                database,
+                &names,
+                structure,
+                content,
+                drop,
+                output_path,
+                !first_write,
+                total,
+                &progress_counter,
+            )?;
+            first_write = false;
+            continue;
+        }
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let temp_paths: Vec<PathBuf> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                std::env::temp_dir().join(format!(
+                    "dumper-part-{}-{}-{}.sql",
+                    std::process::id(),
+                    stamp,
+                    i
+                ))
+            })
+            .collect();
+
+        let results: Mutex<Vec<(usize, Result<(), String>)>> = Mutex::new(Vec::new());
+
+        std::thread::scope(|scope| {
+            for (i, chunk) in chunks.iter().enumerate() {
+                let temp_path = temp_paths[i].clone();
+                let host = host.to_string();
+                let user = user.to_string();
+                let pass = pass.to_string();
+                let database = database.to_string();
+                let chunk = chunk.clone();
+                let progress_counter = Arc::clone(&progress_counter);
+                let app = app.clone();
+                let results = &results;
+
+                scope.spawn(move || {
+                    let path_str = temp_path.to_string_lossy().to_string();
+                    let result = run_mysqldump_to_file(
+                        &app,
+                        &host,
+                        port,
+                        &user,
+                        &pass,
+                        &database,
+                        &chunk,
+                        structure,
+                        content,
+                        drop,
+                        &path_str,
+                        false,
+                        total,
+                        &progress_counter,
+                    );
+                    if let Ok(mut guard) = results.lock() {
+                        guard.push((i, result));
+                    }
+                });
+            }
+        });
+
+        let mut ordered = results
+            .into_inner()
+            .unwrap_or_default();
+        ordered.sort_by_key(|(i, _)| *i);
+
+        let mut dump_error: Option<String> = None;
+        for (_, result) in &ordered {
+            if let Err(e) = result {
+                dump_error = Some(e.clone());
+                break;
+            }
+        }
+
+        if let Some(err) = dump_error {
+            for path in &temp_paths {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(err);
+        }
+
+        for path in &temp_paths {
+            if !path.exists() {
+                continue;
+            }
+            if first_write {
+                std::fs::copy(path, output_path).map_err(|e| e.to_string())?;
+                first_write = false;
+            } else {
+                append_file_to_output(output_path, path, true)?;
+            }
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     Ok(())
@@ -969,7 +1194,7 @@ async fn copy_database(
     }
 
     DUMP_CANCELLED.store(false, Ordering::SeqCst);
-    DUMP_PID.store(0, Ordering::SeqCst);
+    clear_all_dump_pids();
 
     let selected = if let Some(list) = tables {
         list.into_iter()
@@ -989,6 +1214,7 @@ async fn copy_database(
                 structure: true,
                 content: true,
                 drop: true,
+                size: Some(t.size),
             })
             .collect()
     };

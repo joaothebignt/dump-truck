@@ -3,6 +3,7 @@
     "description": "Permite salvar dumps SQL em qualquer pasta (DEV).",
     "windows": ["main"],
     "permissions": [
-      "fs:write-all"
+      "fs:write-all",
+      "fs:allow-read-text-file"
     ]
   }

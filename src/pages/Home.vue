@@ -1,10 +1,16 @@
 <script setup>
 
-import { onMounted, onUnmounted, ref, watch } from "vue"
+import { computed, onMounted, onUnmounted, ref, watch } from "vue"
 import { useRouter } from "vue-router"
 import { invoke } from "@tauri-apps/api/core"
+import { open, save } from "@tauri-apps/plugin-dialog"
+import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs"
 
-import { useConnectionsStore } from "../stores/connections"
+import {
+  connectionsFromImport,
+  normalizeConnection,
+  useConnectionsStore
+} from "../stores/connections"
 import { useDatabaseStore } from "../stores/database"
 
 const router = useRouter()
@@ -12,6 +18,17 @@ const store = useConnectionsStore()
 const dbStore = useDatabaseStore()
 const connectionStatus = ref({})
 const STATUS_POLL_MS = 4000
+const importOpen = ref(false)
+const importItems = ref([])
+const replaceAll = ref(false)
+
+const canExport = computed(() => (store.favorites || []).length > 0)
+const importCountLabel = computed(() => {
+  const count = importItems.value.length
+  return count === 1
+    ? "1 conexão encontrada no arquivo."
+    : `${count} conexões encontradas no arquivo.`
+})
 
 let statusTimer = null
 let statusCheckInFlight = false
@@ -114,6 +131,79 @@ function newConnection() {
 
 }
 
+async function exportConnections() {
+  if (!canExport.value)
+    return
+
+  try {
+    const path = await save({
+      defaultPath: "conexoes.json",
+      filters: [{ name: "JSON", extensions: ["json"] }]
+    })
+
+    if (!path)
+      return
+
+    await writeTextFile(
+      path,
+      JSON.stringify(store.exportPayload(), null, 2)
+    )
+  } catch (e) {
+    console.error(e)
+    alert("Não foi possível exportar as conexões.\n\nDetalhes: " + e)
+  }
+}
+
+async function pickImportFile() {
+  try {
+    const path = await open({
+      multiple: false,
+      title: "Importar conexões",
+      filters: [{ name: "JSON", extensions: ["json"] }]
+    })
+
+    if (!path || Array.isArray(path))
+      return
+
+    const text = await readTextFile(path)
+    const parsed = JSON.parse(text)
+    const list = connectionsFromImport(parsed)
+
+    if (!list) {
+      alert("O arquivo não contém uma lista de conexões válida.")
+      return
+    }
+
+    const normalized = list
+      .map(normalizeConnection)
+      .filter(Boolean)
+
+    if (!normalized.length) {
+      alert("Nenhuma conexão válida encontrada no arquivo.")
+      return
+    }
+
+    importItems.value = normalized
+    replaceAll.value = false
+    importOpen.value = true
+  } catch (e) {
+    console.error(e)
+    alert("Não foi possível ler o arquivo JSON.\n\nDetalhes: " + e)
+  }
+}
+
+function cancelImport() {
+  importOpen.value = false
+  importItems.value = []
+  replaceAll.value = false
+}
+
+function confirmImport() {
+  store.applyImport(importItems.value, { replace: replaceAll.value })
+  cancelImport()
+  refreshConnectionStatus()
+}
+
 async function connect(connection) {
 
   try{
@@ -158,9 +248,28 @@ async function connect(connection) {
           Escolha uma conexão favorita para começar.
         </p>
       </div>
-      <button class="btn btn--primary" @click="newConnection">
-        Nova conexão
-      </button>
+      <div class="home-actions">
+        <button
+          class="btn btn--ghost"
+          type="button"
+          :disabled="!canExport"
+          @click="exportConnections"
+        >
+          <i class="ri-download-2-line" aria-hidden="true"></i>
+          Exportar conexões
+        </button>
+        <button
+          class="btn btn--ghost"
+          type="button"
+          @click="pickImportFile"
+        >
+          <i class="ri-upload-2-line" aria-hidden="true"></i>
+          Importar conexões
+        </button>
+        <button class="btn btn--primary" type="button" @click="newConnection">
+          Nova conexão
+        </button>
+      </div>
     </div>
 
     <div
@@ -238,6 +347,57 @@ async function connect(connection) {
         </div>
       </div>
     </div>
+
+    <Teleport to="body">
+      <div
+        v-if="importOpen"
+        class="import-backdrop"
+        @click.self="cancelImport"
+      >
+        <div
+          class="import-panel"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="import-title"
+        >
+          <h2 id="import-title" class="import-title">Importar conexões</h2>
+          <p class="import-text">{{ importCountLabel }}</p>
+
+          <label class="import-replace">
+            <input
+              v-model="replaceAll"
+              type="checkbox"
+            />
+            <span>Substituir todas as conexões</span>
+          </label>
+
+          <p class="import-hint">
+            {{
+              replaceAll
+                ? "As conexões atuais serão removidas e estas passam a ser as únicas salvas."
+                : "Estas conexões serão adicionadas às que você já tem."
+            }}
+          </p>
+
+          <div class="import-actions">
+            <button
+              class="btn btn--ghost"
+              type="button"
+              @click="cancelImport"
+            >
+              Cancelar
+            </button>
+            <button
+              class="btn btn--primary"
+              type="button"
+              @click="confirmImport"
+            >
+              Importar
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
   </div>
 
 </template>
@@ -263,6 +423,13 @@ async function connect(connection) {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.home-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .home-title {
@@ -525,7 +692,66 @@ async function connect(connection) {
   padding-block: 6px;
 }
 
+.import-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.72);
+}
+
+.import-panel {
+  width: min(420px, 100%);
+  border-radius: 18px;
+  border: 1px solid #27272a;
+  background: #050816;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.85);
+  padding: 22px 20px 18px;
+}
+
+.import-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 500;
+}
+
+.import-text,
+.import-hint {
+  margin: 10px 0 0;
+  font-size: 13px;
+  color: #9ca3af;
+  line-height: 1.45;
+}
+
+.import-replace {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 16px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.import-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 18px;
+}
+
 @media (max-width: 720px) {
+  .home-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .home-actions {
+    justify-content: flex-start;
+  }
+
   .connections-grid {
     grid-template-columns: minmax(0, 1fr);
   }

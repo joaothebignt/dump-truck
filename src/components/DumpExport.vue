@@ -435,8 +435,12 @@ async function runExport(selectedTables, filePath) {
       const index = Number(payload.index) || 0
       if (total > 0) {
         totalTables.value = total
-        exportedCount.value = Math.min(index, total)
-        progress.value = Math.min(99, Math.round((index / total) * 100))
+        // Nunca regride (dump paralelo pode emitir fora de ordem na UI).
+        exportedCount.value = Math.max(exportedCount.value, Math.min(index, total))
+        progress.value = Math.max(
+          progress.value,
+          Math.min(99, Math.round((exportedCount.value / total) * 100))
+        )
       }
     })
 
@@ -463,7 +467,8 @@ async function runExport(selectedTables, filePath) {
         name: t.name,
         structure: !!t.structure,
         content: !!t.content,
-        drop: !!t.drop
+        drop: !!t.drop,
+        size: t.size || 0
       })),
       outputPath: filePath
     })
@@ -522,7 +527,8 @@ async function startCopy() {
       name: t.name,
       structure: !!t.structure,
       content: !!t.content,
-      drop: !!t.drop
+      drop: !!t.drop,
+      size: t.size || 0
     }))
 
   if (!selected.length)
@@ -551,8 +557,11 @@ async function startCopy() {
       const index = Number(payload.index) || 0
       if (total > 0) {
         totalTables.value = total
-        exportedCount.value = Math.min(index, total)
-        progress.value = Math.min(90, Math.round((index / total) * 90))
+        exportedCount.value = Math.max(exportedCount.value, Math.min(index, total))
+        progress.value = Math.max(
+          progress.value,
+          Math.min(90, Math.round((exportedCount.value / total) * 90))
+        )
       }
     })
 
