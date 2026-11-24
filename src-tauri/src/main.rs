@@ -194,7 +194,6 @@ fn mysqldump_supports(flag: &str) -> bool {
 fn apply_mysqldump_safe_flags(cmd: &mut Command) {
     cmd.arg("--single-transaction")
         .arg("--skip-lock-tables")
-        .arg("--set-gtid-purged=OFF")
         .arg("--quick")
         .arg("--extended-insert")
         .arg("--hex-blob")
@@ -208,6 +207,12 @@ fn apply_mysqldump_safe_flags(cmd: &mut Command) {
         // Continua mesmo se alguma tabela/view falhar (ex.: sem SHOW VIEW).
         .arg("--force")
         .arg("--verbose");
+
+    // Só existe no cliente MySQL. O mysqldump do MariaDB (padrão do Homebrew)
+    // aborta com "unknown variable 'set-gtid-purged=OFF'".
+    if mysqldump_supports("set-gtid-purged") {
+        cmd.arg("--set-gtid-purged=OFF");
+    }
 
     // MySQL 8 cliente → servidor antigo: column-statistics dispara queries
     // caras em INFORMATION_SCHEMA e costuma ser o maior freio em hosts remotos.
